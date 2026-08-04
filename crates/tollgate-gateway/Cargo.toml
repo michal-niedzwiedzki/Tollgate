@@ -16,4 +16,8 @@ redis = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 base64 = { workspace = true }
-alloy = { workspace = true, default-features = false, features = ["std"] }
+alloy = { workspace = true, default-features = false, features = ["std", "sol-types", "eip712", "k256"] }
+
+[dev-dependencies]
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+rand_core = { version = "0.6", features = ["getrandom"] }

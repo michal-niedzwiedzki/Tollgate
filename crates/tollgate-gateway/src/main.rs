@@ -7,6 +7,7 @@ use tollgate_core::{db, Config};
 
 mod routes;
 mod state;
+mod verify;
 mod x402;
 
 use state::AppState;

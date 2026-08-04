@@ -7,6 +7,7 @@ use tollgate_core::db;
 use tollgate_core::error::ErrorBody;
 
 use crate::state::AppState;
+use crate::verify::recover_payer;
 use crate::x402;
 use crate::x402::decode::decode_payment_header;
 use crate::x402::validate::validate_fields;
@@ -14,8 +15,9 @@ use crate::x402::validate::validate_fields;
 const X_PAYMENT: HeaderName = HeaderName::from_static("x-payment");
 
 /// `ANY /v1/proxy/{provider_slug}/{*path}`. An unpaid request gets a spec-shaped 402. A request
-/// with an `X-PAYMENT` header that fails cheap field validation also gets a 402, naming the
-/// reason. Signature recovery lands in Task 2.4.
+/// with an `X-PAYMENT` header that fails cheap field validation or signature recovery also gets
+/// a 402, naming the reason. A fully verified payment gets a debug 200 for now; the real proxy
+/// lands in Phase 4.
 pub async fn handle_proxy_request(
     State(state): State<AppState>,
     Path((provider_slug, _path)): Path<(String, String)>,
@@ -72,7 +74,15 @@ pub async fn handle_proxy_request(
         return payment_required(reason.reason().to_string());
     }
 
-    // Signature recovery lands in Task 2.4; a payload that passes cheap field validation has
-    // no further handling here yet.
-    Json(serde_json::json!({"status": "fields_valid"})).into_response()
+    let payer = match recover_payer(&payload, &state.cfg) {
+        Ok(payer) => payer,
+        Err(err) => return payment_required(err.to_string()),
+    };
+
+    Json(serde_json::json!({
+        "payer": payer.to_string(),
+        "amount": payload.payload.authorization.value.to_string(),
+        "provider": provider.slug,
+    }))
+    .into_response()
 }
