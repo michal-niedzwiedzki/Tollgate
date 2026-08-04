@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
-use axum::routing::get;
+use axum::routing::{any, get};
 use axum::Router;
 use tokio::signal;
 use tollgate_core::{db, Config};
 
 mod routes;
 mod state;
+mod x402;
 
 use state::AppState;
 
@@ -36,6 +37,10 @@ async fn main() -> anyhow::Result<()> {
             get(routes::providers::list_providers).post(routes::providers::create_provider),
         )
         .route("/v1/providers/{slug}", get(routes::providers::get_provider))
+        .route(
+            "/v1/proxy/{provider_slug}/{*path}",
+            any(routes::proxy::handle_proxy_request),
+        )
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;

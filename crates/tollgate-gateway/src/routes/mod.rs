@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use crate::state::AppState;
 
 pub mod providers;
+pub mod proxy;
 
 pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     let postgres_ok = sqlx::query("SELECT 1").execute(&state.pg).await.is_ok();

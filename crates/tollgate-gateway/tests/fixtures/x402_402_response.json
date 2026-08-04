@@ -1,0 +1,21 @@
+{
+  "x402Version": 1,
+  "accepts": [
+    {
+      "scheme": "exact",
+      "network": "eip155:84532",
+      "maxAmountRequired": "1000",
+      "asset": "0x0000000000000000000000000000000000000002",
+      "payTo": "0x0101010101010101010101010101010101010101",
+      "resource": "http://localhost:8080/v1/proxy/mock-ok/ok",
+      "description": "",
+      "mimeType": "",
+      "maxTimeoutSeconds": 300,
+      "extra": {
+        "name": "USDC",
+        "version": "2"
+      }
+    }
+  ],
+  "error": "payment required"
+}
