@@ -73,8 +73,6 @@ pub fn caip2_network(chain_id: u64) -> String {
 }
 
 /// Decoding the `X-PAYMENT` header into a typed payload. Decode only, no crypto.
-/// Wired into the proxy route in Task 2.3, so its public items are unused until then.
-#[allow(dead_code)]
 pub mod decode {
     use alloy::primitives::{Address, Bytes, B256, U256};
     use base64::engine::general_purpose::STANDARD as BASE64;
@@ -304,6 +302,213 @@ pub mod decode {
                 serde_json::Value::String(format!("0x{}", "cd".repeat(31)));
             let err = decode_payment_header(&encode(&json)).unwrap_err();
             assert!(matches!(err, X402Error::MalformedField { field, .. } if field == "payload.authorization.nonce"));
+        }
+    }
+}
+
+/// Cheap field validation, run before any signature recovery
+/// (`architecture.md` §4.2 step 2).
+pub mod validate {
+    use tollgate_core::{Config, Provider};
+
+    use super::decode::PaymentPayload;
+    use super::caip2_network;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ValidationFailure {
+        Expired,
+        NotYetActive,
+        ValidityWindowTooLong,
+        NetworkMismatch,
+        SchemeMismatch,
+        PayToMismatch,
+        ValueMismatch,
+    }
+
+    impl ValidationFailure {
+        pub fn reason(&self) -> &'static str {
+            match self {
+                Self::Expired => "expired",
+                Self::NotYetActive => "not_yet_active",
+                Self::ValidityWindowTooLong => "validity_window_too_long",
+                Self::NetworkMismatch => "network_mismatch",
+                Self::SchemeMismatch => "scheme_mismatch",
+                Self::PayToMismatch => "pay_to_mismatch",
+                Self::ValueMismatch => "value_mismatch",
+            }
+        }
+    }
+
+    /// Runs the seven cheap checks in `architecture.md` §4.2 step 2, in order, returning the
+    /// first that fails.
+    pub fn validate_fields(
+        payload: &PaymentPayload,
+        provider: &Provider,
+        cfg: &Config,
+        now: u64,
+    ) -> Result<(), ValidationFailure> {
+        let auth = &payload.payload.authorization;
+
+        // 1. not expired
+        if auth.valid_before <= now + cfg.clock_skew_seconds {
+            return Err(ValidationFailure::Expired);
+        }
+        // 2. already active
+        if auth.valid_after > now + cfg.clock_skew_seconds {
+            return Err(ValidationFailure::NotYetActive);
+        }
+        // 3. validity window not longer than the quote validity the nonce TTL can cover
+        if auth.valid_before - now > cfg.quote_validity_seconds + cfg.clock_skew_seconds {
+            return Err(ValidationFailure::ValidityWindowTooLong);
+        }
+        // 4. network matches the configured chain
+        if payload.network != caip2_network(cfg.chain_id) {
+            return Err(ValidationFailure::NetworkMismatch);
+        }
+        // 5. scheme is exact
+        if payload.scheme != "exact" {
+            return Err(ValidationFailure::SchemeMismatch);
+        }
+        // 6. payee matches the provider's payout address
+        if auth.to != provider.payout_address {
+            return Err(ValidationFailure::PayToMismatch);
+        }
+        // 7. value matches the provider's exact price
+        if auth.value != provider.price_wei {
+            return Err(ValidationFailure::ValueMismatch);
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use alloy::primitives::{Address, U256, B256};
+        use std::str::FromStr;
+        use tollgate_core::Scheme;
+
+        fn test_config() -> Config {
+            Config {
+                database_url: "postgres://postgres:postgres@localhost:5432/tollgate".to_string(),
+                redis_url: "redis://localhost:6379".to_string(),
+                bind_addr: "0.0.0.0:8080".parse().unwrap(),
+                chain_id: 84532,
+                rpc_url: "http://localhost:8545".to_string(),
+                usdc_address: "0x0000000000000000000000000000000000000002".to_string(),
+                batch_settler_address: "0x0000000000000000000000000000000000000001".to_string(),
+                settler_private_key: "0xabc".to_string(),
+                gateway_signing_key: "0xdef".to_string(),
+                quote_validity_seconds: 300,
+                clock_skew_seconds: 60,
+                settler_batch_size: 50,
+                settler_flush_seconds: 10,
+            }
+        }
+
+        fn test_provider() -> Provider {
+            Provider {
+                slug: "mock-ok".to_string(),
+                upstream_url: "http://127.0.0.1:9000".to_string(),
+                price_wei: U256::from(1000u64),
+                max_price_wei: None,
+                scheme: Scheme::Exact,
+                payout_address: Address::from_str("0x0101010101010101010101010101010101010101")
+                    .unwrap(),
+                timeout_ms: 5000,
+            }
+        }
+
+        const NOW: u64 = 1_000_000;
+
+        fn valid_payload() -> PaymentPayload {
+            PaymentPayload {
+                x402_version: 1,
+                scheme: "exact".to_string(),
+                network: "eip155:84532".to_string(),
+                payload: super::super::decode::ExactEvmPayload {
+                    signature: alloy::primitives::Bytes::from_str(&format!(
+                        "0x{}",
+                        "ab".repeat(65)
+                    ))
+                    .unwrap(),
+                    authorization: super::super::decode::Authorization {
+                        from: Address::from_str("0x0303030303030303030303030303030303030303")
+                            .unwrap(),
+                        to: Address::from_str("0x0101010101010101010101010101010101010101")
+                            .unwrap(),
+                        value: U256::from(1000u64),
+                        valid_after: NOW - 10,
+                        valid_before: NOW + 200,
+                        nonce: B256::from_str(&format!("0x{}", "cd".repeat(32))).unwrap(),
+                    },
+                },
+            }
+        }
+
+        #[test]
+        fn all_valid_passes() {
+            let result = validate_fields(&valid_payload(), &test_provider(), &test_config(), NOW);
+            assert_eq!(result, Ok(()));
+        }
+
+        #[test]
+        fn expired_is_rejected() {
+            let mut payload = valid_payload();
+            payload.payload.authorization.valid_before = NOW - 1;
+            let result = validate_fields(&payload, &test_provider(), &test_config(), NOW);
+            assert_eq!(result, Err(ValidationFailure::Expired));
+        }
+
+        #[test]
+        fn not_yet_active_is_rejected() {
+            let mut payload = valid_payload();
+            payload.payload.authorization.valid_after = NOW + 1000;
+            let result = validate_fields(&payload, &test_provider(), &test_config(), NOW);
+            assert_eq!(result, Err(ValidationFailure::NotYetActive));
+        }
+
+        #[test]
+        fn overlong_validity_window_is_rejected() {
+            let mut payload = valid_payload();
+            let cfg = test_config();
+            payload.payload.authorization.valid_before =
+                NOW + cfg.quote_validity_seconds + cfg.clock_skew_seconds + 1;
+            let result = validate_fields(&payload, &test_provider(), &cfg, NOW);
+            assert_eq!(result, Err(ValidationFailure::ValidityWindowTooLong));
+        }
+
+        #[test]
+        fn network_mismatch_is_rejected() {
+            let mut payload = valid_payload();
+            payload.network = "eip155:1".to_string();
+            let result = validate_fields(&payload, &test_provider(), &test_config(), NOW);
+            assert_eq!(result, Err(ValidationFailure::NetworkMismatch));
+        }
+
+        #[test]
+        fn scheme_mismatch_is_rejected() {
+            let mut payload = valid_payload();
+            payload.scheme = "upto".to_string();
+            let result = validate_fields(&payload, &test_provider(), &test_config(), NOW);
+            assert_eq!(result, Err(ValidationFailure::SchemeMismatch));
+        }
+
+        #[test]
+        fn pay_to_mismatch_is_rejected() {
+            let mut payload = valid_payload();
+            payload.payload.authorization.to =
+                Address::from_str("0x0909090909090909090909090909090909090909").unwrap();
+            let result = validate_fields(&payload, &test_provider(), &test_config(), NOW);
+            assert_eq!(result, Err(ValidationFailure::PayToMismatch));
+        }
+
+        #[test]
+        fn value_mismatch_is_rejected() {
+            let mut payload = valid_payload();
+            payload.payload.authorization.value = U256::from(999u64);
+            let result = validate_fields(&payload, &test_provider(), &test_config(), NOW);
+            assert_eq!(result, Err(ValidationFailure::ValueMismatch));
         }
     }
 }
