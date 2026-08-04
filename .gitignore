@@ -1,0 +1,8 @@
+target/
+.env
+node_modules/
+__pycache__/
+.venv/
+contracts/out/
+contracts/cache/
+dashboard/.next/

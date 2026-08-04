@@ -4,6 +4,23 @@ Derived from `architecture.md` and `prd.md`. This document is the sequential bui
 Execute one task at a time, top to bottom. Do not skip ahead. Do not start a phase until the previous
 Phase Gate passes.
 
+> ## Git policy — read before executing anything
+>
+> **The agent must never run git write commands.** No `git add`, `git commit`, `git push`,
+> `git reset`, `git revert`, `git checkout`, `git switch`, `git stash`, `git merge`, `git rebase`,
+> `git branch`, `git tag`, or `git clean`. Not even when a task below ends with a commit message.
+>
+> Every "**Commit.**" line in this document is a **suggested commit message for the human to use**.
+> It is not an instruction to the agent.
+>
+> Read-only git (`status`, `diff`, `log`, `show`) is allowed and encouraged.
+>
+> When a task's verification passes, stop, print `git diff --stat` and the suggested message as
+> text, and wait for the human to review and commit.
+>
+> The one exception is Task 0.1's `git init`, which creates the repository. Run that once, then
+> touch git no further.
+
 ---
 
 ## Project goal
@@ -206,7 +223,8 @@ that answers `GET /health` with the liveness of both Postgres and Redis.
 **Objective.** Create the git repository and an empty three-crate Rust workspace that compiles.
 
 **Implementation.**
-- `git init` at the repo root. Add `.gitignore` covering `target/`, `.env`, `node_modules/`,
+- `git init` at the repo root. This is the only git write command the agent ever runs; see the Git
+  policy above. Do not `git add` or `git commit` afterwards. Add `.gitignore` covering `target/`, `.env`, `node_modules/`,
   `__pycache__/`, `.venv/`, `contracts/out/`, `contracts/cache/`, `dashboard/.next/`.
 - Root `Cargo.toml`: `[workspace]` with `members = ["crates/tollgate-core", "crates/tollgate-gateway",
   "crates/tollgate-settler"]`, `resolver = "2"`, and a `[workspace.dependencies]` block pinning
@@ -220,12 +238,12 @@ that answers `GET /health` with the liveness of both Postgres and Redis.
 
 **Verification.**
 ```
-cargo build --workspace      # succeeds
+cargo build --workspace        # succeeds
 cargo run -p tollgate-gateway  # prints hello, exits 0
-git status                   # clean after commit; target/ ignored
+git status                     # target/ and .env do not appear as untracked
 ```
 
-**Commit.** `chore: initialise cargo workspace and repository scaffolding`
+**Suggested commit message (for the human).** `chore: initialise cargo workspace and repository scaffolding`
 
 ---
 
@@ -1979,6 +1997,9 @@ window budgets, the refund path, channel mode, the second chain.
 ---
 
 ## Commit summary
+
+These are the commits **the human** will make, one per completed and verified task. The agent
+proposes messages and never commits.
 
 | Phase | Tasks | Commits |
 |-------|-------|---------|
