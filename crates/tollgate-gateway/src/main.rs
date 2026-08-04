@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use axum::routing::{any, get};
 use axum::Router;
+use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::signal;
 use tollgate_core::{db, Config};
 
@@ -24,15 +25,22 @@ async fn main() -> anyhow::Result<()> {
     let pg = db::pg_pool(&cfg).await?;
     sqlx::migrate!("../../migrations").run(&pg).await?;
     let redis = db::redis_conn(&cfg).await?;
+    let prometheus_handle = PrometheusBuilder::new()
+        .set_buckets(&[
+            0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0,
+        ])?
+        .install_recorder()?;
 
     let state = AppState {
         cfg: Arc::new(cfg),
         pg,
         redis,
+        prometheus_handle,
     };
 
     let app = Router::new()
         .route("/health", get(routes::health))
+        .route("/metrics", get(routes::metrics))
         .route(
             "/v1/providers",
             get(routes::providers::list_providers).post(routes::providers::create_provider),

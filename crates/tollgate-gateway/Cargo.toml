@@ -17,6 +17,8 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 base64 = { workspace = true }
 alloy = { workspace = true, default-features = false, features = ["std", "sol-types", "eip712", "k256"] }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 
 [dev-dependencies]
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }

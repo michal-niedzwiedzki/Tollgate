@@ -9,6 +9,7 @@ sqlx = { workspace = true }
 redis = { workspace = true }
 alloy = { workspace = true, default-features = false, features = ["std"] }
 serde = { workspace = true }
+metrics = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

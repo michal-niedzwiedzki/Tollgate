@@ -6,6 +6,8 @@ use axum::response::{IntoResponse, Json};
 use tollgate_core::db;
 use tollgate_core::error::ErrorBody;
 
+use tollgate_core::metrics::StageTimer;
+
 use crate::state::AppState;
 use crate::verify::recover_payer;
 use crate::x402;
@@ -24,6 +26,8 @@ pub async fn handle_proxy_request(
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> axum::response::Response {
+    let _total_timer = StageTimer::start("total");
+
     let provider = match db::get_provider(&state.pg, &provider_slug).await {
         Ok(Some(provider)) => provider,
         Ok(None) => {
@@ -60,9 +64,12 @@ pub async fn handle_proxy_request(
         return payment_required("payment required".to_string());
     };
 
-    let payload = match decode_payment_header(payment_header) {
-        Ok(payload) => payload,
-        Err(err) => return payment_required(err.to_string()),
+    let payload = {
+        let _timer = StageTimer::start("decode");
+        match decode_payment_header(payment_header) {
+            Ok(payload) => payload,
+            Err(err) => return payment_required(err.to_string()),
+        }
     };
 
     let now = SystemTime::now()
@@ -74,9 +81,12 @@ pub async fn handle_proxy_request(
         return payment_required(reason.reason().to_string());
     }
 
-    let payer = match recover_payer(&payload, &state.cfg) {
-        Ok(payer) => payer,
-        Err(err) => return payment_required(err.to_string()),
+    let payer = {
+        let _timer = StageTimer::start("recover");
+        match recover_payer(&payload, &state.cfg) {
+            Ok(payer) => payer,
+            Err(err) => return payment_required(err.to_string()),
+        }
     };
 
     Json(serde_json::json!({

@@ -30,3 +30,7 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Value>) 
 
     (status_code, Json(body))
 }
+
+pub async fn metrics(State(state): State<AppState>) -> String {
+    state.prometheus_handle.render()
+}
