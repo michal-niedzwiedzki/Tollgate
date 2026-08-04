@@ -20,6 +20,7 @@ async fn main() -> anyhow::Result<()> {
     let bind_addr = cfg.bind_addr;
 
     let pg = db::pg_pool(&cfg).await?;
+    sqlx::migrate!("../../migrations").run(&pg).await?;
     let redis = db::redis_conn(&cfg).await?;
 
     let state = AppState {

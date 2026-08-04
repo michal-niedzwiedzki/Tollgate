@@ -22,3 +22,6 @@ wait_healthy() {
 
 wait_healthy postgres
 wait_healthy redis
+
+: "${DATABASE_URL:=postgres://postgres:postgres@localhost:5432/tollgate}"
+sqlx migrate run --database-url "$DATABASE_URL"
