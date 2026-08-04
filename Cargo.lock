@@ -3587,9 +3587,11 @@ dependencies = [
 name = "tollgate-gateway"
 version = "0.1.0"
 dependencies = [
+ "alloy",
  "anyhow",
  "axum",
  "redis",
+ "serde",
  "serde_json",
  "sqlx",
  "tokio",

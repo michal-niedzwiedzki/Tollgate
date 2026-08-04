@@ -31,6 +31,11 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/health", get(routes::health))
+        .route(
+            "/v1/providers",
+            get(routes::providers::list_providers).post(routes::providers::create_provider),
+        )
+        .route("/v1/providers/{slug}", get(routes::providers::get_provider))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
