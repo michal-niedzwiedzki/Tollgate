@@ -17,6 +17,7 @@ pub struct CreateProviderRequest {
     upstream_url: String,
     price: String,
     payout_address: String,
+    scheme: Option<String>,
     timeout_ms: Option<i32>,
 }
 
@@ -103,12 +104,23 @@ pub async fn create_provider(
         }
     };
 
+    let scheme = match Scheme::parse(body.scheme.as_deref().unwrap_or("exact")) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody::new("invalid_scheme", e.to_string())),
+            )
+                .into_response();
+        }
+    };
+
     let provider = Provider {
         slug: body.slug,
         upstream_url: body.upstream_url,
         price_wei,
         max_price_wei: None,
-        scheme: Scheme::Exact,
+        scheme,
         payout_address,
         timeout_ms: body.timeout_ms.unwrap_or(30_000),
     };

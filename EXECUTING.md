@@ -65,7 +65,7 @@ Later phases add `forge test`, `pytest`, and `npm run build` via `./scripts/chec
 ```
 Read plan.md, architecture.md and prd.md.
 
-We are starting Phase N. Do not write any code yet.
+We are starting Phase 2. Do not write any code yet.
 
 Tell me:
 1. Phase N's objective and what will exist when it's done
