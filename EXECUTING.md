@@ -84,7 +84,7 @@ you know is hard, that's a signal to push back rather than proceed.
 ## 2. Per-task prompt (the main one)
 
 ```
-Execute Task 0.2 from plan.md.
+Execute Next Task from plan.md.
 
 Scope: only what that task's Implementation section describes. Nothing else, no drive-by
 refactors, no extra abstractions, no "while I'm here" changes.
