@@ -10,6 +10,15 @@ pub enum Error {
 
     #[error("redis error: {0}")]
     Redis(#[from] redis::RedisError),
+
+    #[error("unsupported scheme: {0}")]
+    UnsupportedScheme(String),
+
+    #[error("invalid numeric value: {0}")]
+    InvalidNumeric(String),
+
+    #[error("invalid address: {0}")]
+    InvalidAddress(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
