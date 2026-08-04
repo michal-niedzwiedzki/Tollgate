@@ -14,4 +14,6 @@ serde_json = { workspace = true }
 sqlx = { workspace = true }
 redis = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
+base64 = { workspace = true }
 alloy = { workspace = true, default-features = false, features = ["std"] }
