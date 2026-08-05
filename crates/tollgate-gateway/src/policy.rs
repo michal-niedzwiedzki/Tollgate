@@ -1,35 +1,38 @@
 //! Driver for the atomic claim script (`lua/claim.lua`, architecture.md §9.1).
 //!
 //! Task 3.1 built the script and the raw invocation (`ClaimScript::claim`). Task 3.2
-//! adds the typed wrapper (`ClaimRequest` / `ClaimOutcome`, via `ClaimScript::submit`)
-//! and the cap-metadata seeding used by `POST /v1/budgets`.
+//! added the typed wrapper (`ClaimRequest` / `ClaimOutcome`, via `ClaimScript::submit`)
+//! and the cap-metadata seeding used by `POST /v1/budgets`. Task 3.3 wires `submit`
+//! into the proxy request path with the status codes from architecture.md §4.3.
 
+use alloy::primitives::{keccak256, Address};
 use redis::aio::ConnectionManager;
 use redis::{RedisResult, Script};
 
-// The items below carrying `allow(dead_code)` get their production caller in
-// Task 3.3, which wires `ClaimScript::submit` into the proxy request path. The
-// attributes come off as each one gains that caller.
-
 /// The Redis stream every reservation is appended to, inside the same atomic
 /// execution as the spend increment (architecture.md §9.3).
-#[allow(dead_code)]
 pub const RESERVATIONS_KEY: &str = "tg:reservations";
 
 const CLAIM_LUA: &str = include_str!("lua/claim.lua");
 
-#[allow(dead_code)]
 pub fn nonce_key(nonce: &str) -> String {
     format!("tg:nonce:{nonce}")
 }
 
-#[allow(dead_code)]
 pub fn spent_key(cap_hash: &str) -> String {
     format!("tg:cap:{cap_hash}:spent")
 }
 
 pub fn meta_key(cap_hash: &str) -> String {
     format!("tg:cap:{cap_hash}:meta")
+}
+
+/// Phase 3's payer-level stand-in for a capability hash. `POST /v1/budgets` seeds
+/// meta under this hash and the proxy route looks it up under the same hash, so
+/// the two must compute it identically; shared here rather than duplicated so
+/// they cannot drift apart.
+pub fn payer_cap_hash(payer: &Address) -> String {
+    keccak256(payer.as_slice()).to_string()
 }
 
 /// Writes `tg:cap:{cap_hash}:meta` from already-parsed base units. This is what
@@ -62,13 +65,11 @@ pub async fn seed_cap_meta(
 /// means that invariant was violated somewhere upstream. Asserted, not just
 /// checked, for exactly that reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[allow(dead_code)]
 pub enum TtlError {
     #[error("validity window already elapsed: valid_before + clock_skew <= now")]
     AlreadyElapsed,
 }
 
-#[allow(dead_code)]
 pub fn nonce_ttl_secs(valid_before: u64, now: u64, clock_skew_seconds: u64) -> Result<u64, TtlError> {
     let ttl = valid_before as i128 + clock_skew_seconds as i128 - now as i128;
     if ttl <= 0 {
@@ -81,7 +82,6 @@ pub fn nonce_ttl_secs(valid_before: u64, now: u64, clock_skew_seconds: u64) -> R
 /// One invocation's worth of input. `cap_hashes` is root-first and may hold any
 /// number of levels: Phase 3 passes exactly one (the payer), Phase 5 passes the
 /// whole capability chain without the script changing.
-#[allow(dead_code)]
 pub struct ClaimArgs<'a> {
     pub nonce: &'a str,
     pub payer: &'a str,
@@ -123,7 +123,6 @@ impl ClaimScript {
     /// The reply is the raw array the script returns: `["replay"]`,
     /// `["missing_meta", level, hash]`, `["cap_exceeded", level, hash, limit]`,
     /// `["insufficient", level, hash, remaining]`, or `["ok", stream_id]`.
-    #[allow(dead_code)]
     pub async fn claim(
         &self,
         conn: &mut ConnectionManager,
@@ -169,7 +168,6 @@ impl Default for ClaimScript {
 /// payer (`POST /v1/budgets`'s stand-in); Phase 5 fills this from a verified
 /// capability chain without changing the script or this type.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct CapLevel {
     pub cap_hash: String,
 }
@@ -177,7 +175,6 @@ pub struct CapLevel {
 /// The typed request into the claim script. Carries the same fixed fields as
 /// `ClaimArgs` plus the level list in the higher-level shape callers naturally
 /// have on hand.
-#[allow(dead_code)]
 pub struct ClaimRequest<'a> {
     pub nonce: &'a str,
     pub amount: u128,
@@ -195,7 +192,6 @@ pub struct ClaimRequest<'a> {
 /// (one who never called `/v1/budgets`) hits exactly this path, and Task 3.1's
 /// script deliberately treats a missing level as an error, never a silent pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum ClaimOutcome {
     Ok { stream_id: String },
     Replay,
@@ -205,7 +201,6 @@ pub enum ClaimOutcome {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[allow(dead_code)]
 pub enum ClaimError {
     #[error("redis error: {0}")]
     Redis(#[from] redis::RedisError),
@@ -251,7 +246,6 @@ fn parse_outcome(raw: Vec<String>) -> Result<ClaimOutcome, ClaimError> {
 impl ClaimScript {
     /// The typed entry point: converts a `ClaimRequest` into the raw `ClaimArgs`
     /// call and parses the reply into a `ClaimOutcome`.
-    #[allow(dead_code)]
     pub async fn submit(
         &self,
         conn: &mut ConnectionManager,
@@ -607,3 +601,4 @@ mod ttl {
         assert_eq!(err, TtlError::AlreadyElapsed);
     }
 }
+

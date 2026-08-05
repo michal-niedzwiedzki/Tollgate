@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use alloy::primitives::{keccak256, Address};
+use alloy::primitives::Address;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
@@ -98,7 +98,7 @@ pub async fn seed_budget(
         }
     };
 
-    let cap_hash = keccak256(payer.as_slice()).to_string();
+    let cap_hash = policy::payer_cap_hash(&payer);
 
     let mut redis = state.redis.clone();
     if let Err(e) = policy::seed_cap_meta(&mut redis, &cap_hash, max_total, max_per_request).await {
