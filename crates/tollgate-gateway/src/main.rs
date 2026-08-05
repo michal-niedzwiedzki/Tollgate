@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use axum::Router;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::signal;
@@ -55,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::providers::list_providers).post(routes::providers::create_provider),
         )
         .route("/v1/providers/{slug}", get(routes::providers::get_provider))
+        .route("/v1/budgets", post(routes::budgets::seed_budget))
         .route(
             "/v1/proxy/{provider_slug}/{*path}",
             any(routes::proxy::handle_proxy_request),

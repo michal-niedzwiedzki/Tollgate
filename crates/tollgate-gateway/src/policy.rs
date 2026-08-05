@@ -1,16 +1,15 @@
 //! Driver for the atomic claim script (`lua/claim.lua`, architecture.md §9.1).
 //!
-//! This task owns the script and the plumbing that loads and invokes it. The typed
-//! `ClaimRequest` / `ClaimOutcome` wrapper and the cap-metadata seeding endpoint are
-//! Task 3.2, so `claim` deliberately returns the raw reply array for now.
+//! Task 3.1 built the script and the raw invocation (`ClaimScript::claim`). Task 3.2
+//! adds the typed wrapper (`ClaimRequest` / `ClaimOutcome`, via `ClaimScript::submit`)
+//! and the cap-metadata seeding used by `POST /v1/budgets`.
 
 use redis::aio::ConnectionManager;
 use redis::{RedisResult, Script};
 
-// The items below carrying `allow(dead_code)` are exercised by this module's tests
-// and get their production caller in Task 3.2 (the typed wrapper and the cap-meta
-// seeding endpoint) and Task 3.3 (the request path). The attributes come off as
-// each one gains that caller.
+// The items below carrying `allow(dead_code)` get their production caller in
+// Task 3.3, which wires `ClaimScript::submit` into the proxy request path. The
+// attributes come off as each one gains that caller.
 
 /// The Redis stream every reservation is appended to, inside the same atomic
 /// execution as the spend increment (architecture.md §9.3).
@@ -29,9 +28,54 @@ pub fn spent_key(cap_hash: &str) -> String {
     format!("tg:cap:{cap_hash}:spent")
 }
 
-#[allow(dead_code)]
 pub fn meta_key(cap_hash: &str) -> String {
     format!("tg:cap:{cap_hash}:meta")
+}
+
+/// Writes `tg:cap:{cap_hash}:meta` from already-parsed base units. This is what
+/// `POST /v1/budgets` seeds for the payer-level stand-in (architecture.md §5.1's
+/// key shape; Phase 5 replaces the source of these keys with a real capability
+/// chain, but the shape is unchanged).
+pub async fn seed_cap_meta(
+    conn: &mut ConnectionManager,
+    cap_hash: &str,
+    max_total: u128,
+    max_per_request: u128,
+) -> RedisResult<()> {
+    redis::cmd("HSET")
+        .arg(meta_key(cap_hash))
+        .arg("max_total")
+        .arg(max_total.to_string())
+        .arg("max_per_request")
+        .arg(max_per_request.to_string())
+        .exec_async(conn)
+        .await
+}
+
+/// architecture.md §9.2 rule 2: the nonce TTL must never be a constant, or the
+/// Redis guard can expire while the EIP-3009 signature is still validly
+/// replayable. `now` and `valid_before` are unix seconds; `clock_skew_seconds`
+/// is the same tolerance `x402::validate::validate_fields` already applied.
+///
+/// By the time this runs, `validate_fields` step 1 has already rejected a
+/// `valid_before` at or before `now + clock_skew`, so a non-positive result here
+/// means that invariant was violated somewhere upstream. Asserted, not just
+/// checked, for exactly that reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[allow(dead_code)]
+pub enum TtlError {
+    #[error("validity window already elapsed: valid_before + clock_skew <= now")]
+    AlreadyElapsed,
+}
+
+#[allow(dead_code)]
+pub fn nonce_ttl_secs(valid_before: u64, now: u64, clock_skew_seconds: u64) -> Result<u64, TtlError> {
+    let ttl = valid_before as i128 + clock_skew_seconds as i128 - now as i128;
+    if ttl <= 0 {
+        return Err(TtlError::AlreadyElapsed);
+    }
+    debug_assert!(ttl > 0, "checked above; nonce TTL must be positive");
+    Ok(ttl as u64)
 }
 
 /// One invocation's worth of input. `cap_hashes` is root-first and may hold any
@@ -121,6 +165,118 @@ impl Default for ClaimScript {
     }
 }
 
+/// One capability level, root first. Phase 3 passes exactly one, keyed by the
+/// payer (`POST /v1/budgets`'s stand-in); Phase 5 fills this from a verified
+/// capability chain without changing the script or this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct CapLevel {
+    pub cap_hash: String,
+}
+
+/// The typed request into the claim script. Carries the same fixed fields as
+/// `ClaimArgs` plus the level list in the higher-level shape callers naturally
+/// have on hand.
+#[allow(dead_code)]
+pub struct ClaimRequest<'a> {
+    pub nonce: &'a str,
+    pub amount: u128,
+    pub levels: Vec<CapLevel>,
+    pub provider_slug: &'a str,
+    pub payer: &'a str,
+    pub ttl_secs: u64,
+    pub payload_json: &'a str,
+    pub signature_hex: &'a str,
+}
+
+/// The claim script's reply, parsed. `MissingMeta` is not in `architecture.md`
+/// §4.3's failure table because that table assumes a capability chain has
+/// already been through Task 5.4's meta upsert; in Phase 3, an unfunded payer
+/// (one who never called `/v1/budgets`) hits exactly this path, and Task 3.1's
+/// script deliberately treats a missing level as an error, never a silent pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ClaimOutcome {
+    Ok { stream_id: String },
+    Replay,
+    CapExceeded { level: usize, cap_hash: String, limit: u128 },
+    Insufficient { level: usize, cap_hash: String, remaining: u128 },
+    MissingMeta { level: usize, cap_hash: String },
+}
+
+#[derive(Debug, thiserror::Error)]
+#[allow(dead_code)]
+pub enum ClaimError {
+    #[error("redis error: {0}")]
+    Redis(#[from] redis::RedisError),
+    #[error("unexpected claim script reply: {0:?}")]
+    UnexpectedReply(Vec<String>),
+}
+
+fn parse_outcome(raw: Vec<String>) -> Result<ClaimOutcome, ClaimError> {
+    fn get(raw: &[String], i: usize) -> Result<&str, ClaimError> {
+        raw.get(i)
+            .map(String::as_str)
+            .ok_or_else(|| ClaimError::UnexpectedReply(raw.to_vec()))
+    }
+    fn parse<T: std::str::FromStr>(raw: &[String], i: usize) -> Result<T, ClaimError> {
+        get(raw, i)?
+            .parse()
+            .map_err(|_| ClaimError::UnexpectedReply(raw.to_vec()))
+    }
+
+    match get(&raw, 0)? {
+        "ok" => Ok(ClaimOutcome::Ok {
+            stream_id: get(&raw, 1)?.to_string(),
+        }),
+        "replay" => Ok(ClaimOutcome::Replay),
+        "cap_exceeded" => Ok(ClaimOutcome::CapExceeded {
+            level: parse(&raw, 1)?,
+            cap_hash: get(&raw, 2)?.to_string(),
+            limit: parse(&raw, 3)?,
+        }),
+        "insufficient" => Ok(ClaimOutcome::Insufficient {
+            level: parse(&raw, 1)?,
+            cap_hash: get(&raw, 2)?.to_string(),
+            remaining: parse(&raw, 3)?,
+        }),
+        "missing_meta" => Ok(ClaimOutcome::MissingMeta {
+            level: parse(&raw, 1)?,
+            cap_hash: get(&raw, 2)?.to_string(),
+        }),
+        _ => Err(ClaimError::UnexpectedReply(raw)),
+    }
+}
+
+impl ClaimScript {
+    /// The typed entry point: converts a `ClaimRequest` into the raw `ClaimArgs`
+    /// call and parses the reply into a `ClaimOutcome`.
+    #[allow(dead_code)]
+    pub async fn submit(
+        &self,
+        conn: &mut ConnectionManager,
+        request: ClaimRequest<'_>,
+    ) -> Result<ClaimOutcome, ClaimError> {
+        let cap_hashes: Vec<String> = request.levels.into_iter().map(|l| l.cap_hash).collect();
+        let raw = self
+            .claim(
+                conn,
+                ClaimArgs {
+                    nonce: request.nonce,
+                    payer: request.payer,
+                    provider_slug: request.provider_slug,
+                    amount: request.amount,
+                    ttl_secs: request.ttl_secs,
+                    payload_json: request.payload_json,
+                    signature_hex: request.signature_hex,
+                    cap_hashes: &cap_hashes,
+                },
+            )
+            .await?;
+        parse_outcome(raw)
+    }
+}
+
 #[cfg(test)]
 mod claim {
     use super::*;
@@ -154,13 +310,7 @@ mod claim {
     }
 
     async fn seed_meta(conn: &mut ConnectionManager, cap_hash: &str, max_total: u128, max_per_request: u128) {
-        redis::cmd("HSET")
-            .arg(meta_key(cap_hash))
-            .arg("max_total")
-            .arg(max_total.to_string())
-            .arg("max_per_request")
-            .arg(max_per_request.to_string())
-            .exec_async(conn)
+        seed_cap_meta(conn, cap_hash, max_total, max_per_request)
             .await
             .expect("seeding cap meta should succeed");
     }
@@ -430,5 +580,30 @@ mod claim {
             AMOUNT * PERMITTED,
             "total spend must never exceed max_total"
         );
+    }
+}
+
+#[cfg(test)]
+mod ttl {
+    use super::*;
+
+    #[test]
+    fn ttl_equals_valid_before_minus_now_plus_skew() {
+        let ttl = nonce_ttl_secs(1_000, 700, 60).expect("validity has not elapsed");
+        assert_eq!(ttl, 1_000 - 700 + 60);
+    }
+
+    #[test]
+    fn a_payload_whose_validity_already_elapsed_errors() {
+        // valid_before + clock_skew (560) is behind now (700): already elapsed.
+        let err = nonce_ttl_secs(500, 700, 60).unwrap_err();
+        assert_eq!(err, TtlError::AlreadyElapsed);
+    }
+
+    #[test]
+    fn exactly_zero_ttl_is_also_an_error() {
+        // valid_before + clock_skew == now: the boundary must not be granted a TTL of 0.
+        let err = nonce_ttl_secs(640, 700, 60).unwrap_err();
+        assert_eq!(err, TtlError::AlreadyElapsed);
     }
 }
