@@ -6,6 +6,7 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::signal;
 use tollgate_core::{db, Config};
 
+mod policy;
 mod routes;
 mod state;
 mod verify;
@@ -24,7 +25,14 @@ async fn main() -> anyhow::Result<()> {
 
     let pg = db::pg_pool(&cfg).await?;
     sqlx::migrate!("../../migrations").run(&pg).await?;
-    let redis = db::redis_conn(&cfg).await?;
+    let mut redis = db::redis_conn(&cfg).await?;
+
+    // SCRIPT LOAD once at startup so the first paid request pays for an EVALSHA
+    // and not for a NOSCRIPT round trip.
+    let claim_script = policy::ClaimScript::new();
+    let claim_sha = claim_script.load(&mut redis).await?;
+    tracing::info!(%claim_sha, "loaded the atomic claim script");
+
     let prometheus_handle = PrometheusBuilder::new()
         .set_buckets(&[
             0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0,
@@ -35,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
         cfg: Arc::new(cfg),
         pg,
         redis,
+        claim_script: Arc::new(claim_script),
         prometheus_handle,
     };
 
