@@ -18,7 +18,20 @@
 -- ARGV[4]                  nonce, hex
 -- ARGV[5]                  payer address
 -- ARGV[6]                  provider slug
--- ARGV[7 .. n+6]           capability hash per level, root first
+-- ARGV[7]                  full EIP-3009 payload, JSON
+-- ARGV[8]                  payment signature, 0x hex
+-- ARGV[9 .. n+8]           capability hash per level, root first
+--
+-- The variadic capability block stays last so that adding a fixed field never
+-- requires knowing n to find it.
+--
+-- The payload and signature ride along in the stream entry rather than being
+-- written to Postgres by the request handler. They have to: architecture.md §9.3
+-- requires the reservation and the decrement to live or die together, so a crash
+-- between the claim and the ledger write must not strand a charge that can no
+-- longer be settled. authorisations.payload and .signature are both NOT NULL, and
+-- the Phase 6 settler rebuilds transferWithAuthorization out of exactly these two
+-- values, so nothing downstream works without them here.
 --
 -- Returns exactly one of:
 --   {'replay'}
@@ -55,7 +68,7 @@ local max_per_request = {}
 local spent = {}
 
 for i = 1, levels do
-    cap_hash[i] = ARGV[6 + i]
+    cap_hash[i] = ARGV[8 + i]
 
     local meta = redis.call('HMGET', KEYS[levels + 2 + i], 'max_total', 'max_per_request')
     max_total[i] = tonumber(meta[1])
@@ -109,6 +122,8 @@ local stream_id = redis.call('XADD', stream_key, '*',
     'payer', ARGV[5],
     'provider', ARGV[6],
     'amount', ARGV[1],
+    'payload', ARGV[7],
+    'signature', ARGV[8],
     'cap_hashes', table.concat(cap_hash, ','))
 
 return { 'ok', stream_id }

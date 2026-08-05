@@ -44,6 +44,14 @@ pub struct ClaimArgs<'a> {
     pub provider_slug: &'a str,
     pub amount: u128,
     pub ttl_secs: u64,
+    /// The full EIP-3009 payload, already serialised as JSON. It is carried
+    /// through the stream untouched and lands in `authorisations.payload`
+    /// (JSONB, NOT NULL), so the caller owes valid JSON here.
+    pub payload_json: &'a str,
+    /// The payment signature as 0x hex, landing in `authorisations.signature`
+    /// (BYTEA, NOT NULL) once the drain decodes it. The Phase 6 settler rebuilds
+    /// v/r/s from this.
+    pub signature_hex: &'a str,
     pub cap_hashes: &'a [String],
 }
 
@@ -89,13 +97,16 @@ impl ClaimScript {
             invocation.key(meta_key(cap_hash));
         }
 
+        // ARGV[1..8] are fixed; the variadic capability block is ARGV[9..].
         invocation
             .arg(args.amount.to_string())
             .arg(args.ttl_secs)
             .arg(args.cap_hashes.len())
             .arg(args.nonce)
             .arg(args.payer)
-            .arg(args.provider_slug);
+            .arg(args.provider_slug)
+            .arg(args.payload_json)
+            .arg(args.signature_hex);
         for cap_hash in args.cap_hashes {
             invocation.arg(cap_hash.as_str());
         }
@@ -180,6 +191,13 @@ mod claim {
             .expect("TTL should succeed")
     }
 
+    /// Shaped like the real thing: nested objects and quoted hex, so the round trip
+    /// through redis-rs, Lua and XADD is actually exercised rather than trivially
+    /// satisfied by a bare token.
+    const PAYLOAD_JSON: &str = r#"{"x402Version":1,"scheme":"exact","network":"eip155:84532","payload":{"authorization":{"from":"0x00000000000000000000000000000000000000a1","to":"0x0000000000000000000000000000000000000001","value":"1000","validAfter":"0","validBefore":"99999999999","nonce":"0xab"}}}"#;
+
+    const SIGNATURE_HEX: &str = "0x1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff001c";
+
     fn args<'a>(nonce: &'a str, amount: u128, cap_hashes: &'a [String]) -> ClaimArgs<'a> {
         ClaimArgs {
             nonce,
@@ -187,6 +205,8 @@ mod claim {
             provider_slug: "mock-ok",
             amount,
             ttl_secs: 360,
+            payload_json: PAYLOAD_JSON,
+            signature_hex: SIGNATURE_HEX,
             cap_hashes,
         }
     }
@@ -310,20 +330,31 @@ mod claim {
         assert_eq!(spent(&mut conn, &cap).await, 2_500);
         assert_eq!(stream_len(&mut conn).await, before + 1, "one reservation appended");
 
-        // The stream entry carries what the Postgres drain in Task 3.4 will need.
-        let entry: redis::Value = redis::cmd("XRANGE")
+        // The stream entry must carry everything the Task 3.4 drain needs to build a
+        // complete `authorisations` row, because that row is the Phase 6 settler's
+        // only input.
+        let entries: Vec<(String, Vec<String>)> = redis::cmd("XRANGE")
             .arg(RESERVATIONS_KEY)
             .arg(&reply[1])
             .arg(&reply[1])
             .query_async(&mut conn)
             .await
             .unwrap();
-        let rendered = format!("{entry:?}");
-        for field in ["nonce", "payer", "provider", "amount", "cap_hashes"] {
-            assert!(rendered.contains(field), "stream entry should carry {field}");
-        }
-        assert!(rendered.contains(&nonce));
-        assert!(rendered.contains(&cap));
+        assert_eq!(entries.len(), 1, "the returned stream id should address one entry");
+        let fields: std::collections::HashMap<&str, &str> = entries[0]
+            .1
+            .chunks(2)
+            .map(|pair| (pair[0].as_str(), pair[1].as_str()))
+            .collect();
+
+        assert_eq!(fields["nonce"], nonce);
+        assert_eq!(fields["payer"], "0x00000000000000000000000000000000000000a1");
+        assert_eq!(fields["provider"], "mock-ok");
+        assert_eq!(fields["amount"], "2500");
+        assert_eq!(fields["cap_hashes"], cap);
+        // Byte-identical, quotes and all: the drain re-parses this as JSONB.
+        assert_eq!(fields["payload"], PAYLOAD_JSON, "payload must survive the round trip verbatim");
+        assert_eq!(fields["signature"], SIGNATURE_HEX);
     }
 
     #[tokio::test]
