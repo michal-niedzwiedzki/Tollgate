@@ -6,6 +6,7 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::signal;
 use tollgate_core::{db, Config};
 
+mod ledger;
 mod policy;
 mod routes;
 mod state;
@@ -38,6 +39,8 @@ async fn main() -> anyhow::Result<()> {
             0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0,
         ])?
         .install_recorder()?;
+
+    tokio::spawn(ledger::run(cfg.redis_url.clone(), pg.clone()));
 
     let state = AppState {
         cfg: Arc::new(cfg),
