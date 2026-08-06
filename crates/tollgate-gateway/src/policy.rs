@@ -55,6 +55,23 @@ pub async fn seed_cap_meta(
         .await
 }
 
+/// Credits `amount` back to every given cap level after an upstream failure
+/// (Task 4.4, architecture.md §4.2 step 7: 2xx promotes, everything else
+/// voids and credits back). Deliberately does not touch `tg:nonce:{nonce}`:
+/// the EIP-3009 signature is still replayable until `validBefore`, so
+/// releasing the nonce here would reopen the free-shopping window the atomic
+/// claim exists to close. The claimed request simply never settles.
+pub async fn void(conn: &mut ConnectionManager, cap_hashes: &[String], amount: u128) -> RedisResult<()> {
+    for cap_hash in cap_hashes {
+        redis::cmd("DECRBY")
+            .arg(spent_key(cap_hash))
+            .arg(amount.to_string())
+            .exec_async(conn)
+            .await?;
+    }
+    Ok(())
+}
+
 /// architecture.md §9.2 rule 2: the nonce TTL must never be a constant, or the
 /// Redis guard can expire while the EIP-3009 signature is still validly
 /// replayable. `now` and `valid_before` are unix seconds; `clock_skew_seconds`

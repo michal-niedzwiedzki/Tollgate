@@ -10,6 +10,7 @@ use tollgate_core::Provider;
 
 use tollgate_core::metrics::StageTimer;
 
+use crate::ledger;
 use crate::policy::{self, CapLevel, ClaimOutcome, ClaimRequest};
 use crate::proxy;
 use crate::state::AppState;
@@ -143,7 +144,9 @@ pub async fn handle_proxy_request(
     let claim_request = ClaimRequest {
         nonce: &nonce_hex,
         amount,
-        levels: vec![CapLevel { cap_hash }],
+        levels: vec![CapLevel {
+            cap_hash: cap_hash.clone(),
+        }],
         provider_slug: &provider.slug,
         payer: &payer_hex,
         ttl_secs,
@@ -170,10 +173,65 @@ pub async fn handle_proxy_request(
                 body,
                 client_addr: Some(client_addr),
             };
-            match proxy::proxy_request(&state.proxy_client, &provider, inbound).await {
-                Ok(response) => response,
-                Err(err) => proxy::proxy_error_response(err),
+            let proxy_result = proxy::proxy_request(&state.proxy_client, &provider, inbound).await;
+
+            // architecture.md §4.2 step 7 / §4.3: a 2xx promotes the reservation to
+            // settleable; anything else voids it and credits the budget back. A
+            // non-5xx upstream response is still forwarded to the caller as-is
+            // (Task 4.3's redirect decision extended to the rest of the non-2xx
+            // range); only a 5xx becomes a 502, since the upstream's own error
+            // detail is not this gateway's to leak verbatim.
+            let (outcome, response) = match proxy_result {
+                Ok(resp) if resp.status().is_success() => {
+                    let code = i32::from(resp.status().as_u16());
+                    (ledger::ReservationOutcome::Queued { upstream_status: code }, resp)
+                }
+                Ok(resp) if resp.status().is_server_error() => {
+                    let code = i32::from(resp.status().as_u16());
+                    let outcome = ledger::ReservationOutcome::Voided {
+                        upstream_status: Some(code),
+                    };
+                    let response = (
+                        StatusCode::BAD_GATEWAY,
+                        Json(ErrorBody::new(
+                            "upstream_error",
+                            format!("upstream responded {code}"),
+                        )),
+                    )
+                        .into_response();
+                    (outcome, response)
+                }
+                Ok(resp) => {
+                    let code = i32::from(resp.status().as_u16());
+                    let outcome = ledger::ReservationOutcome::Voided {
+                        upstream_status: Some(code),
+                    };
+                    (outcome, resp)
+                }
+                Err(err) => {
+                    let outcome = ledger::ReservationOutcome::Voided {
+                        upstream_status: None,
+                    };
+                    let response = proxy::proxy_error_response(err);
+                    (outcome, response)
+                }
+            };
+
+            let mut redis = state.redis.clone();
+            if let Err(err) = ledger::mark_outcome(&mut redis, &nonce_hex, &outcome).await {
+                tracing::error!(error = %err, "failed to write outcome marker");
             }
+            if let Err(err) = ledger::apply_outcome_update(&state.pg, auth.nonce.as_slice(), &outcome).await
+            {
+                tracing::error!(error = %err, "failed to apply reservation outcome update");
+            }
+            if matches!(outcome, ledger::ReservationOutcome::Voided { .. })
+                && let Err(err) = policy::void(&mut redis, &[cap_hash], amount).await
+            {
+                tracing::error!(error = %err, "failed to credit budget back after void");
+            }
+
+            response
         }
         Ok(ClaimOutcome::Replay) => (
             StatusCode::CONFLICT,

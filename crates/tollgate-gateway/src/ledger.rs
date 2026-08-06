@@ -18,6 +18,87 @@ const CONSUMER_NAME: &str = "gateway";
 const BATCH_SIZE: usize = 100;
 const BLOCK_MS: usize = 1000;
 
+/// How long a `tg:outcome:{nonce}` marker survives, generously longer than any
+/// realistic drain lag. Bridges the race between the proxy request path
+/// finishing before the drain has inserted a row for that nonce yet: see
+/// `mark_outcome` and `insert_reservation`.
+const OUTCOME_MARKER_TTL_SECS: u64 = 3600;
+
+/// Where a reservation ends up once the proxy round trip is known:
+/// architecture.md §4.2 step 7. A 2xx promotes it to `queued`, settleable;
+/// anything else voids it. `upstream_status` is `None` only when no HTTP
+/// response was ever received at all (a timeout or a connector failure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservationOutcome {
+    Queued { upstream_status: i32 },
+    Voided { upstream_status: Option<i32> },
+}
+
+impl ReservationOutcome {
+    fn status_str(&self) -> &'static str {
+        match self {
+            ReservationOutcome::Queued { .. } => "queued",
+            ReservationOutcome::Voided { .. } => "voided",
+        }
+    }
+
+    fn upstream_status(&self) -> Option<i32> {
+        match self {
+            ReservationOutcome::Queued { upstream_status } => Some(*upstream_status),
+            ReservationOutcome::Voided { upstream_status } => *upstream_status,
+        }
+    }
+}
+
+fn outcome_marker_key(nonce_hex: &str) -> String {
+    format!("tg:outcome:{nonce_hex}")
+}
+
+/// Writes the small marker `insert_reservation` consults if it inserts this
+/// nonce's row after the request path has already decided the outcome — the
+/// common case is the drain running first (it just inserts `reserved` and
+/// this marker goes unread), but under load the request can finish first.
+pub async fn mark_outcome(
+    redis: &mut ConnectionManager,
+    nonce_hex: &str,
+    outcome: &ReservationOutcome,
+) -> redis::RedisResult<()> {
+    let value = match outcome.upstream_status() {
+        Some(code) => format!("{}:{code}", outcome.status_str()),
+        None => format!("{}:", outcome.status_str()),
+    };
+    redis::cmd("SET")
+        .arg(outcome_marker_key(nonce_hex))
+        .arg(value)
+        .arg("EX")
+        .arg(OUTCOME_MARKER_TTL_SECS)
+        .query_async(redis)
+        .await
+}
+
+/// The request path's own idempotent attempt at the same update, for the
+/// common case where the drain's row already landed by the time the proxy
+/// round trip finishes. `WHERE status = 'reserved'` makes the transition
+/// one-way (`reserved -> queued` or `reserved -> voided` only) and makes a
+/// racing `mark_outcome` + drain insert safe: whichever of this UPDATE and
+/// the drain's INSERT runs second is a no-op against the other's result.
+pub async fn apply_outcome_update(
+    pg: &PgPool,
+    nonce: &[u8],
+    outcome: &ReservationOutcome,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE authorisations SET status = $1, upstream_status = $2
+         WHERE nonce = $3 AND status = 'reserved'",
+    )
+    .bind(outcome.status_str())
+    .bind(outcome.upstream_status())
+    .bind(nonce)
+    .execute(pg)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Creates the consumer group if needed, replays anything left pending from a
 /// previous run, then loops reading and applying new entries forever.
 ///
@@ -170,7 +251,7 @@ async fn apply_batch(
     entries: Vec<(String, HashMap<String, String>)>,
 ) {
     for (id, fields) in entries {
-        match insert_reservation(pg, &fields).await {
+        match insert_reservation(redis, pg, &fields).await {
             Ok(()) => {
                 if let Err(err) = ack(redis, &id).await {
                     tracing::error!(error = %err, entry_id = %id, "failed to XACK a committed reservation");
@@ -196,7 +277,11 @@ async fn ack(redis: &mut ConnectionManager, id: &str) -> redis::RedisResult<()> 
         .await
 }
 
-async fn insert_reservation(pg: &PgPool, fields: &HashMap<String, String>) -> Result<(), String> {
+async fn insert_reservation(
+    redis: &mut ConnectionManager,
+    pg: &PgPool,
+    fields: &HashMap<String, String>,
+) -> Result<(), String> {
     let get = |key: &str| {
         fields
             .get(key)
@@ -216,12 +301,35 @@ async fn insert_reservation(pg: &PgPool, fields: &HashMap<String, String>) -> Re
     let signature =
         Bytes::from_str(signature_hex).map_err(|e| format!("bad signature {signature_hex}: {e}"))?;
 
+    // The proxy request path may have already decided this nonce's outcome
+    // (2xx/non-2xx/timeout) and left a marker before the drain ever inserted
+    // a row for it — under load, the request can finish before the drain
+    // catches up. If so, insert the row with that final status directly
+    // rather than 'reserved', so it is never observably 'reserved' after
+    // the outcome is already known.
+    let marker: Option<String> = redis::cmd("GET")
+        .arg(outcome_marker_key(nonce_hex))
+        .query_async(redis)
+        .await
+        .map_err(|e| format!("failed to read outcome marker: {e}"))?;
+
+    let (status, upstream_status): (&str, Option<i32>) = match marker.as_deref() {
+        Some(marker) => {
+            let (status, code) = marker.split_once(':').unwrap_or((marker, ""));
+            (status, code.parse::<i32>().ok())
+        }
+        None => ("reserved", None),
+    };
+
     // The nonce is the idempotency key end to end (architecture.md §9.4): a
     // reservation already landed from an earlier, unacked delivery is not an
-    // error.
+    // error. This is also the other half of the outcome-marker race: if the
+    // request path's own `apply_outcome_update` already updated this row
+    // (the common case, drain usually wins the race to insert first), this
+    // INSERT is the one that becomes the no-op instead.
     sqlx::query(
-        "INSERT INTO authorisations (nonce, payer, provider_slug, amount_wei, payload, signature, status)
-         VALUES ($1, $2, $3, $4::NUMERIC, $5::JSONB, $6, 'reserved')
+        "INSERT INTO authorisations (nonce, payer, provider_slug, amount_wei, payload, signature, status, upstream_status)
+         VALUES ($1, $2, $3, $4::NUMERIC, $5::JSONB, $6, $7, $8)
          ON CONFLICT (nonce) DO NOTHING",
     )
     .bind(nonce.as_slice())
@@ -230,6 +338,8 @@ async fn insert_reservation(pg: &PgPool, fields: &HashMap<String, String>) -> Re
     .bind(amount)
     .bind(payload)
     .bind(signature.as_ref())
+    .bind(status)
+    .bind(upstream_status)
     .execute(pg)
     .await
     .map_err(|e| format!("insert failed: {e}"))?;
