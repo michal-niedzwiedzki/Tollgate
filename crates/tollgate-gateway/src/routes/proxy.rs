@@ -1,7 +1,8 @@
+use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{OriginalUri, Path, State};
-use axum::http::{HeaderMap, HeaderName, StatusCode};
+use axum::extract::{ConnectInfo, OriginalUri, Path, State};
+use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
 use axum::response::{IntoResponse, Json};
 use tollgate_core::db;
 use tollgate_core::error::ErrorBody;
@@ -10,6 +11,7 @@ use tollgate_core::Provider;
 use tollgate_core::metrics::StageTimer;
 
 use crate::policy::{self, CapLevel, ClaimOutcome, ClaimRequest};
+use crate::proxy;
 use crate::state::AppState;
 use crate::verify::recover_payer;
 use crate::x402;
@@ -20,13 +22,16 @@ const X_PAYMENT: HeaderName = HeaderName::from_static("x-payment");
 
 /// `ANY /v1/proxy/{provider_slug}/{*path}`. An unpaid request gets a spec-shaped 402. A request
 /// with an `X-PAYMENT` header that fails cheap field validation or signature recovery also gets
-/// a 402, naming the reason. A fully verified payment gets a debug 200 for now; the real proxy
-/// lands in Phase 4.
+/// a 402, naming the reason. A fully verified payment proxies to the upstream and streams its
+/// response back.
 pub async fn handle_proxy_request(
     State(state): State<AppState>,
-    Path((provider_slug, _path)): Path<(String, String)>,
+    Path((provider_slug, path)): Path<(String, String)>,
     OriginalUri(uri): OriginalUri,
+    ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
+    method: Method,
     headers: HeaderMap,
+    body: axum::body::Body,
 ) -> axum::response::Response {
     let _total_timer = StageTimer::start("total");
 
@@ -153,15 +158,23 @@ pub async fn handle_proxy_request(
     };
 
     // architecture.md §10 "free shopping": nothing that can reach the upstream
-    // may run outside the `Ok` arm below. Phase 4's proxy call must be added
-    // inside that arm, never after this match returns.
+    // may run outside the `Ok` arm below. The proxy call lives inside that arm,
+    // never after this match returns.
     match outcome {
-        Ok(ClaimOutcome::Ok { .. }) => Json(serde_json::json!({
-            "payer": payer.to_string(),
-            "amount": payload.payload.authorization.value.to_string(),
-            "provider": provider.slug,
-        }))
-        .into_response(),
+        Ok(ClaimOutcome::Ok { .. }) => {
+            let inbound = proxy::InboundRequest {
+                path: &path,
+                query: uri.query(),
+                method,
+                headers,
+                body,
+                client_addr: Some(client_addr),
+            };
+            match proxy::proxy_request(&state.proxy_client, &provider, inbound).await {
+                Ok(response) => response,
+                Err(err) => proxy::proxy_error_response(err),
+            }
+        }
         Ok(ClaimOutcome::Replay) => (
             StatusCode::CONFLICT,
             Json(ErrorBody::new(

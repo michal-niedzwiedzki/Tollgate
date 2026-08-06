@@ -20,6 +20,12 @@ url = { workspace = true }
 alloy = { workspace = true, default-features = false, features = ["std", "sol-types", "eip712", "k256"] }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+tower = { workspace = true }
+hyper = { workspace = true, features = ["client", "http1"] }
+http = { workspace = true }
+hyper-util = { workspace = true, features = ["client", "client-legacy", "tokio", "http1"] }
+hyper-rustls = { workspace = true, features = ["http1", "webpki-roots", "tls12", "logging", "ring"] }
+http-body-util = { workspace = true }
 
 [dev-dependencies]
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }

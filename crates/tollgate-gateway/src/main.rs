@@ -8,6 +8,7 @@ use tollgate_core::{db, Config};
 
 mod ledger;
 mod policy;
+mod proxy;
 mod routes;
 mod ssrf;
 mod state;
@@ -43,11 +44,14 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::spawn(ledger::run(cfg.redis_url.clone(), pg.clone()));
 
+    let proxy_client = proxy::build_client();
+
     let state = AppState {
         cfg: Arc::new(cfg),
         pg,
         redis,
         claim_script: Arc::new(claim_script),
+        proxy_client,
         prometheus_handle,
     };
 
@@ -69,9 +73,14 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!(%bind_addr, "starting tollgate-gateway");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // `into_make_service_with_connect_info` so the proxy route can read the real peer address
+    // for the X-Forwarded-For header it adds on the way upstream.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     Ok(())
 }
