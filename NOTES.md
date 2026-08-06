@@ -1,5 +1,148 @@
 # NOTES
 
+## Decisions
+
+Ambiguities and doc conflicts resolved before executing a phase, so no task has to re-litigate
+one mid-build. The same role `plan.md`'s "Assumptions and ambiguities discovered" section plays
+for the plan as a whole, for things the plan itself left open.
+
+### Phase 5 — capability delegation
+
+Settled 2026-08-06, before Task 5.1, from a read of `plan.md` §Phase 5, `architecture.md` §5 and
+§9.3, and the Phase 0–4 code as built. Ten decisions, D1–D10.
+
+**D1. The capability header stays optional, permanently. This is the load-bearing one.**
+
+`architecture.md` §4.2 marks `X-Tollgate-Capability` optional, `prd.md` F3 (per-request cap, total
+cap, allowlist) is a standalone P0 that does not mention delegation, and every Phase 2–4 gate item
+pays with no capability header at all. So Task 5.4's "**replace** the single payer-level key list"
+is read as *extend*, not *replace*:
+
+- No header → exactly one level, keyed by `policy::payer_cap_hash(payer)`, seeded by
+  `POST /v1/budgets`. Byte-for-byte the Phase 3 behaviour.
+- Header present → one level per verified chain link, root first.
+
+`POST /v1/budgets` and `payer_cap_hash` therefore **survive Phase 5**. Their current doc comments
+predicting their own removal (`routes/budgets.rs`, `policy.rs`) are wrong and get corrected in
+Task 5.4. The payer hash is not a "stand-in" — it is the degenerate one-level chain.
+
+Both paths build the same `Vec<CapLevel>` through one function, so `claim.lua`, `policy::void`,
+the ledger drain, the Phase 6 settler and the Phase 9 dashboard see one shape and never branch on
+whether delegation was used. This is what keeps Phase 5 from reaching backwards or forwards.
+
+**D2. Maximum chain depth is 4 links total, and therefore at most 4 counters.**
+
+Task 5.4's "up to 4 levels + the funding root" implies five. It is wrong. `architecture.md` §5.2
+rule 1 caps total depth at 4, and §5.3 Resolution A — the locked funding decision — makes the
+chain "pure policy": the parent funds the child wallet on-chain up front, so there is no separate
+funding-root capability to count. Link 0's issuer *is* the funding wallet. `maxDepth` constrains
+how many further links may be issued below a link; it is not a fifth counter.
+
+**D3. `architecture.md` §5.2 rule 2 is deliberately not enforced.**
+
+Rule 2 ("link 0's issuer is the wallet that signs the EIP-3009 payload") and rule 5 ("the final
+link's subject is that same signer") cannot both hold for any chain of depth ≥ 2 under Resolution
+A, where the worker holds its own USDC and signs its own payments. `plan.md`'s Task 5.3 already
+omits rule 2 and keeps rule 5; that omission is correct, and this records it as intentional rather
+than an oversight.
+
+Rule 5 is the property that matters — it is what makes a stolen capability useless. A root issuer
+is unconstrained because a root capability grants nothing it must hold: the money that moves is
+the payer's own, by the payer's own signature. Under Resolution B (channel mode, P1) the parent
+does hold the pooled balance, rule 2 becomes both meaningful and enforceable, and it should be
+reinstated at that point.
+
+**D4. The drain writes the chain. `chain_hashes` lands in Task 5.4, not Task 5.6.**
+
+`claim.lua` already puts `cap_hashes` into every stream entry; `ledger::insert_reservation`
+currently discards it. Task 5.6 assumes the column is populated but never says who populates it.
+
+Resolution: `migrations/0002_chain_hashes.sql` and the drain change both move **into Task 5.4** —
+the task that first creates multi-level charges — so no charge is ever written that Task 5.6
+cannot rebuild from. Task 5.6 becomes a pure consumer. The migration keeps the filename
+`plan.md` names, so the plan's text still resolves.
+
+The drain writes `chain_hashes` for **every** charge, including the D1 single-level payer case.
+One write path, one rebuild path, no NULL special-casing — and Phase 3/4 payer budgets gain
+boot-time rebuild for free.
+
+**D5. `authorisations.capability_hash` gets the leaf hash; ancestors live only in `chain_hashes`.**
+
+The existing column is singular and indexed `(capability_hash, created_at DESC)`. The question it
+answers is "which agent spent this", so the leaf is the right occupant: it is the subject that
+made the request. NULL under D1. Ancestor attribution is `chain_hashes`, which needs no index
+until Phase 9 asks for one. Phase 7's receipts and expense report and Phase 9's agent view both
+get what they need with no further migration.
+
+**D6. Capability rows are a hard precondition for the claim, so the drain can never be poisoned.**
+
+`authorisations.capability_hash` is `REFERENCES capabilities(hash)` and the drain inserts
+asynchronously. If a capability row were ever missing, the drain would take a permanent FK
+violation — a poison entry, which is exactly the wedge below.
+
+So Task 5.4 persists the whole chain into `capabilities` **synchronously, before the claim**, and
+a failure there fails the request closed (500) rather than proceeding. A stream entry can then
+never reference a capability row that does not exist. `chain_hashes` carries no FK and so cannot
+poison the drain under any circumstance.
+
+Row shape: insert root-first, `ON CONFLICT (hash) DO NOTHING`; a root's `parent_hash` is **NULL**,
+never 32 zero bytes, because the column is a self-FK and `0x0` is not a row; `allowlist` NULL
+means inherit.
+
+**D7. No Redis TTL on `tg:cap:*:meta` or `tg:cap:*:spent`.**
+
+Task 5.4 says to seed meta with an "expiry TTL". Doing so is wrong twice over: expiring `:meta`
+while `:spent` survives orphans the counter, and an expired capability would surface as the claim
+script's `missing_meta` — which maps to 402 `insufficient_funds`, not the 403 `capability_expired`
+that `architecture.md` §4.3 requires.
+
+Expiry is enforced in Rust by Task 5.3 rule 7, before the claim, where it produces the correct
+403. `expiry` is still *written* into `:meta` as a plain field for the rebuild and the dashboard,
+but nothing reads it on the hot path and `claim.lua` is unchanged — it still reads only
+`max_total` and `max_per_request`. Key growth is bounded by capability count, not by time;
+a sweep for long-dead capabilities is a Post-MVP concern, not an MVP one.
+
+Meta is upserted **only after `verify_chain` returns Ok**, so meta can only ever be written from a
+chain that has already passed attenuation. That ordering is an invariant, and gets a comment
+saying so.
+
+**D8. The boot rebuild counts `failed`, and excludes only `voided`.**
+
+`plan.md` Task 5.6 and `architecture.md` §9.3 both say `reserved + queued + settled`. That drops
+`failed`, which is a charge whose upstream work *was* delivered to the caller and whose on-chain
+settlement later reverted. Excluding it hands the agent its budget back at every restart — the
+cap-accounting leak §9.3 itself warns about, in the one product area §9.3 calls "the whole
+product". So the sum is `status IN ('reserved','queued','settled','failed')`, and `voided` — the
+only status where the caller got nothing — is the sole exclusion.
+
+Task 5.6's step 1 (`GROUP BY capability_hash`) is superseded by its own step 2 and dropped: it
+would under-count every ancestor. One query, `unnest(chain_hashes)`, grouped by the unnested hash.
+
+**D9. Revocation is one `SMISMEMBER`, and a revocation may not be future-dated.**
+
+Task 5.3's `revoked_set` parameter implies a pre-fetch. It is one pipelined `SMISMEMBER tg:revoked
+h1..hn` for the whole chain — a single round-trip, inside the `capability` histogram — not
+`SMEMBERS`, whose transfer is unbounded. `verify_chain` stays a sync pure function over the
+already-fetched result, exactly as the plan's signature implies, and so stays trivially testable.
+
+Task 5.5's `Revocation.issuedAt` is checked as `issuedAt <= now + clock_skew`. No lower bound:
+revocation is idempotent and monotonic, so replaying an old one can only re-revoke something
+already revoked, but a future-dated one is meaningless and cheap to refuse.
+
+**D10. A committed signing harness, `examples/sign.py`, lands in Task 5.1.**
+
+Every `curl` line in Tasks 5.3–5.6 and half the Phase 5 Gate needs `$P`, `$CHAIN` and
+`$SIGNED_REVOCATION`, and the repo contains no committed tool that can produce any of them. That
+makes a signer a *verification prerequisite*, not scope creep — `CLAUDE.md` forbids claiming a
+verification passed without running it.
+
+It is a throwaway test harness (stdlib + `eth-account`), explicitly labelled as such, and it is
+**not** the Phase 8 client: `client/tollgate/` is the real library and Phase 8 replaces this. It
+also gives Task 5.1's `capability_vectors.json` the cross-language check that fixture exists for,
+a phase before the Python client needs it.
+
+---
+
 ## Deferred
 
 Things noticed during execution that are out of scope for the task that surfaced them.
@@ -52,6 +195,22 @@ should be made deliberately rather than folded into an unrelated commit.
 (Task 5.6) will pass, since `FLUSHALL` clears the PEL too, but any restart *without* a flush after
 a poison entry lands leaves the gateway silently not persisting charges. Clearing the current
 backlog with `XACK`, or a fresh `FLUSHALL`, restores normal operation until the next one.
+
+**Resolved: scheduled for Task 5.6** (decided 2026-08-06, alongside the Phase 5 decisions above).
+Task 5.6 owns boot-time recovery and its own correctness now depends on the drain having actually
+persisted the charges it rebuilds from, so the fix belongs there rather than in a standalone
+commit. `plan.md` Task 5.6 step 6 already names this startup path as part of its sequence.
+
+The fix is the first of the two options above: track the last-read entry id and page forward with
+`XREADGROUP ... <last_id>` instead of re-reading from `0` every iteration, so an entry that can
+never be applied is passed over once per boot instead of redelivered forever. The steady-state
+`>` loop is unchanged, and Task 3.4's "log and continue, never let one bad entry stall the drain"
+rule is preserved — it is finally true of the startup path too, which is the half where it was
+not.
+
+Separately, decision D6 removes the one *new* poison source Phase 5 would otherwise have
+introduced (a `capability_hash` FK violation), so the fix is not being asked to cover for
+Phase 5's own additions.
 
 ### Request path is not tolerant of a Postgres outage
 
