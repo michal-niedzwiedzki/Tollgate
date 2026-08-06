@@ -48,28 +48,47 @@ impl ReservationOutcome {
             ReservationOutcome::Voided { upstream_status } => *upstream_status,
         }
     }
+
+    /// `status:code`, with an empty code when no HTTP response was received.
+    /// Paired with `from_marker` so the two halves cannot drift apart.
+    fn marker_value(&self) -> String {
+        match self.upstream_status() {
+            Some(code) => format!("{}:{code}", self.status_str()),
+            None => format!("{}:", self.status_str()),
+        }
+    }
+
+    fn from_marker(marker: &str) -> Option<Self> {
+        let (status, code) = marker.split_once(':')?;
+        let upstream_status = code.parse::<i32>().ok();
+        match status {
+            "queued" => upstream_status.map(|upstream_status| ReservationOutcome::Queued { upstream_status }),
+            "voided" => Some(ReservationOutcome::Voided { upstream_status }),
+            _ => None,
+        }
+    }
 }
 
 fn outcome_marker_key(nonce_hex: &str) -> String {
     format!("tg:outcome:{nonce_hex}")
 }
 
-/// Writes the small marker `insert_reservation` consults if it inserts this
-/// nonce's row after the request path has already decided the outcome — the
-/// common case is the drain running first (it just inserts `reserved` and
-/// this marker goes unread), but under load the request can finish first.
+/// Writes the small marker `insert_reservation` consults after inserting, for
+/// the case where the request path decided this nonce's outcome before the
+/// drain had inserted a row at all.
+///
+/// **The caller must write this marker before attempting `apply_outcome_update`.**
+/// That ordering is load-bearing: it is what lets the drain's post-INSERT read
+/// (see `insert_reservation`) be guaranteed to observe a marker whenever the
+/// request path's own UPDATE found no row to update.
 pub async fn mark_outcome(
     redis: &mut ConnectionManager,
     nonce_hex: &str,
     outcome: &ReservationOutcome,
 ) -> redis::RedisResult<()> {
-    let value = match outcome.upstream_status() {
-        Some(code) => format!("{}:{code}", outcome.status_str()),
-        None => format!("{}:", outcome.status_str()),
-    };
     redis::cmd("SET")
         .arg(outcome_marker_key(nonce_hex))
-        .arg(value)
+        .arg(outcome.marker_value())
         .arg("EX")
         .arg(OUTCOME_MARKER_TTL_SECS)
         .query_async(redis)
@@ -301,35 +320,14 @@ async fn insert_reservation(
     let signature =
         Bytes::from_str(signature_hex).map_err(|e| format!("bad signature {signature_hex}: {e}"))?;
 
-    // The proxy request path may have already decided this nonce's outcome
-    // (2xx/non-2xx/timeout) and left a marker before the drain ever inserted
-    // a row for it — under load, the request can finish before the drain
-    // catches up. If so, insert the row with that final status directly
-    // rather than 'reserved', so it is never observably 'reserved' after
-    // the outcome is already known.
-    let marker: Option<String> = redis::cmd("GET")
-        .arg(outcome_marker_key(nonce_hex))
-        .query_async(redis)
-        .await
-        .map_err(|e| format!("failed to read outcome marker: {e}"))?;
-
-    let (status, upstream_status): (&str, Option<i32>) = match marker.as_deref() {
-        Some(marker) => {
-            let (status, code) = marker.split_once(':').unwrap_or((marker, ""));
-            (status, code.parse::<i32>().ok())
-        }
-        None => ("reserved", None),
-    };
-
     // The nonce is the idempotency key end to end (architecture.md §9.4): a
     // reservation already landed from an earlier, unacked delivery is not an
-    // error. This is also the other half of the outcome-marker race: if the
-    // request path's own `apply_outcome_update` already updated this row
-    // (the common case, drain usually wins the race to insert first), this
-    // INSERT is the one that becomes the no-op instead.
+    // error. This is also the other half of the outcome race: if the request
+    // path's own `apply_outcome_update` already updated this row (the common
+    // case, where the drain inserted first), this INSERT becomes the no-op.
     sqlx::query(
-        "INSERT INTO authorisations (nonce, payer, provider_slug, amount_wei, payload, signature, status, upstream_status)
-         VALUES ($1, $2, $3, $4::NUMERIC, $5::JSONB, $6, $7, $8)
+        "INSERT INTO authorisations (nonce, payer, provider_slug, amount_wei, payload, signature, status)
+         VALUES ($1, $2, $3, $4::NUMERIC, $5::JSONB, $6, 'reserved')
          ON CONFLICT (nonce) DO NOTHING",
     )
     .bind(nonce.as_slice())
@@ -338,11 +336,246 @@ async fn insert_reservation(
     .bind(amount)
     .bind(payload)
     .bind(signature.as_ref())
-    .bind(status)
-    .bind(upstream_status)
     .execute(pg)
     .await
     .map_err(|e| format!("insert failed: {e}"))?;
 
+    // Read the marker *after* the INSERT, never before. This ordering is what
+    // closes the race, and the reasoning is worth stating exactly because
+    // reading it earlier looks equivalent and is not:
+    //
+    //   The request path always SETs its marker before attempting its own
+    //   UPDATE. So if that UPDATE ran before this INSERT — matching no row and
+    //   silently doing nothing — then the marker was written before the UPDATE,
+    //   hence before this INSERT, hence before this read. It is therefore
+    //   impossible for that UPDATE to have missed *and* this read to miss too.
+    //
+    // Reading before the INSERT left exactly that hole: both sides could read
+    // before the other wrote, and the row stayed 'reserved' forever with no
+    // retry to rescue it.
+    let marker: Option<String> = redis::cmd("GET")
+        .arg(outcome_marker_key(nonce_hex))
+        .query_async(redis)
+        .await
+        .map_err(|e| format!("failed to read outcome marker: {e}"))?;
+
+    if let Some(outcome) = marker.as_deref().and_then(ReservationOutcome::from_marker) {
+        // `WHERE status = 'reserved'` inside makes this idempotent against the
+        // request path having already applied the same transition.
+        apply_outcome_update(pg, nonce.as_slice(), &outcome)
+            .await
+            .map_err(|e| format!("failed to apply outcome marker: {e}"))?;
+    }
+
     Ok(())
+}
+
+#[cfg(test)]
+mod outcome_race {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const TEST_SLUG: &str = "test-outcome-race";
+
+    async fn pg_pool() -> PgPool {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/tollgate".to_string());
+        PgPool::connect(&url)
+            .await
+            .expect("postgres should be reachable; start it with ./scripts/dev.sh")
+    }
+
+    async fn redis_conn() -> ConnectionManager {
+        let url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        redis::Client::open(url)
+            .expect("redis url should parse")
+            .get_connection_manager()
+            .await
+            .expect("redis should be reachable; start it with ./scripts/dev.sh")
+    }
+
+    /// A fresh 32-byte nonce per run, so repeated runs never collide with each
+    /// other's rows (the nonce is the table's primary key).
+    fn unique_nonce() -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the unix epoch")
+            .as_nanos();
+        format!("0x{nanos:064x}")
+    }
+
+    async fn ensure_provider(pg: &PgPool) {
+        sqlx::query(
+            "INSERT INTO providers (slug, upstream_url, price_wei, payout_address)
+             VALUES ($1, 'http://127.0.0.1:9000', 1000::NUMERIC, '\\x01')
+             ON CONFLICT (slug) DO NOTHING",
+        )
+        .bind(TEST_SLUG)
+        .execute(pg)
+        .await
+        .expect("seeding the test provider should succeed");
+    }
+
+    fn stream_fields(nonce_hex: &str) -> HashMap<String, String> {
+        HashMap::from([
+            ("nonce".to_string(), nonce_hex.to_string()),
+            (
+                "payer".to_string(),
+                "0x00000000000000000000000000000000000000a1".to_string(),
+            ),
+            ("provider".to_string(), TEST_SLUG.to_string()),
+            ("amount".to_string(), "1000".to_string()),
+            (
+                "payload".to_string(),
+                r#"{"payload":{"authorization":{"value":"1000"}}}"#.to_string(),
+            ),
+            ("signature".to_string(), "0x1b2c3d".to_string()),
+        ])
+    }
+
+    async fn status_of(pg: &PgPool, nonce_hex: &str) -> Option<(String, Option<i32>)> {
+        let nonce = B256::from_str(nonce_hex).unwrap();
+        sqlx::query_as::<_, (String, Option<i32>)>(
+            "SELECT status, upstream_status FROM authorisations WHERE nonce = $1",
+        )
+        .bind(nonce.as_slice())
+        .fetch_optional(pg)
+        .await
+        .expect("status query should succeed")
+    }
+
+    async fn cleanup(pg: &PgPool, redis: &mut ConnectionManager, nonce_hex: &str) {
+        let nonce = B256::from_str(nonce_hex).unwrap();
+        sqlx::query("DELETE FROM authorisations WHERE nonce = $1")
+            .bind(nonce.as_slice())
+            .execute(pg)
+            .await
+            .ok();
+        let _: Result<(), _> = redis::cmd("DEL")
+            .arg(outcome_marker_key(nonce_hex))
+            .query_async(redis)
+            .await;
+    }
+
+    /// The interleaving that used to strand a reservation at `reserved`
+    /// forever: the request path finished, wrote its marker, and ran its own
+    /// UPDATE against a row the drain had not inserted yet (matching nothing),
+    /// and only then did the drain insert. Nothing retried afterwards.
+    #[tokio::test]
+    #[ignore = "requires live postgres and redis"]
+    async fn a_marker_written_before_the_row_exists_is_still_applied() {
+        let pg = pg_pool().await;
+        let mut redis = redis_conn().await;
+        ensure_provider(&pg).await;
+        let nonce_hex = unique_nonce();
+
+        // Request path: marker, then an UPDATE that matches no row at all.
+        let outcome = ReservationOutcome::Voided {
+            upstream_status: Some(500),
+        };
+        mark_outcome(&mut redis, &nonce_hex, &outcome)
+            .await
+            .expect("marking the outcome should succeed");
+        let nonce = B256::from_str(&nonce_hex).unwrap();
+        let rows = apply_outcome_update(&pg, nonce.as_slice(), &outcome)
+            .await
+            .expect("the update should not error");
+        assert_eq!(rows, 0, "no row exists yet, so this UPDATE must match nothing");
+
+        // Drain arrives afterwards.
+        insert_reservation(&mut redis, &pg, &stream_fields(&nonce_hex))
+            .await
+            .expect("the drain insert should succeed");
+
+        let observed = status_of(&pg, &nonce_hex).await;
+        cleanup(&pg, &mut redis, &nonce_hex).await;
+
+        assert_eq!(
+            observed,
+            Some(("voided".to_string(), Some(500))),
+            "a reservation whose outcome was decided before its row existed must not be left reserved"
+        );
+    }
+
+    /// The common ordering, which must keep working: the drain inserts first,
+    /// then the request path applies the outcome directly.
+    #[tokio::test]
+    #[ignore = "requires live postgres and redis"]
+    async fn the_drain_inserting_first_still_lets_the_request_path_apply_the_outcome() {
+        let pg = pg_pool().await;
+        let mut redis = redis_conn().await;
+        ensure_provider(&pg).await;
+        let nonce_hex = unique_nonce();
+
+        insert_reservation(&mut redis, &pg, &stream_fields(&nonce_hex))
+            .await
+            .expect("the drain insert should succeed");
+        assert_eq!(
+            status_of(&pg, &nonce_hex).await,
+            Some(("reserved".to_string(), None)),
+            "with no outcome decided yet the row starts reserved"
+        );
+
+        let outcome = ReservationOutcome::Queued {
+            upstream_status: 200,
+        };
+        mark_outcome(&mut redis, &nonce_hex, &outcome).await.unwrap();
+        let nonce = B256::from_str(&nonce_hex).unwrap();
+        let rows = apply_outcome_update(&pg, nonce.as_slice(), &outcome)
+            .await
+            .expect("the update should not error");
+
+        let observed = status_of(&pg, &nonce_hex).await;
+        cleanup(&pg, &mut redis, &nonce_hex).await;
+
+        assert_eq!(rows, 1, "the row exists, so the request path's UPDATE applies it");
+        assert_eq!(observed, Some(("queued".to_string(), Some(200))));
+    }
+
+    /// `reserved -> queued -> voided` must be impossible: the transition is
+    /// one-way, enforced by `WHERE status = 'reserved'`.
+    #[tokio::test]
+    #[ignore = "requires live postgres and redis"]
+    async fn the_status_transition_is_one_way() {
+        let pg = pg_pool().await;
+        let mut redis = redis_conn().await;
+        ensure_provider(&pg).await;
+        let nonce_hex = unique_nonce();
+
+        insert_reservation(&mut redis, &pg, &stream_fields(&nonce_hex))
+            .await
+            .expect("the drain insert should succeed");
+        let nonce = B256::from_str(&nonce_hex).unwrap();
+
+        apply_outcome_update(
+            &pg,
+            nonce.as_slice(),
+            &ReservationOutcome::Queued {
+                upstream_status: 200,
+            },
+        )
+        .await
+        .unwrap();
+
+        let rows = apply_outcome_update(
+            &pg,
+            nonce.as_slice(),
+            &ReservationOutcome::Voided {
+                upstream_status: Some(500),
+            },
+        )
+        .await
+        .unwrap();
+
+        let observed = status_of(&pg, &nonce_hex).await;
+        cleanup(&pg, &mut redis, &nonce_hex).await;
+
+        assert_eq!(rows, 0, "a second transition must match no row");
+        assert_eq!(
+            observed,
+            Some(("queued".to_string(), Some(200))),
+            "the first outcome stands"
+        );
+    }
 }

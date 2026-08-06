@@ -218,6 +218,10 @@ pub async fn handle_proxy_request(
             };
 
             let mut redis = state.redis.clone();
+            // Marker first, then the direct UPDATE — this order must not be
+            // swapped. The drain relies on it: it reads the marker after its
+            // own INSERT, so a marker written before this UPDATE is guaranteed
+            // visible to the drain whenever this UPDATE finds no row yet.
             if let Err(err) = ledger::mark_outcome(&mut redis, &nonce_hex, &outcome).await {
                 tracing::error!(error = %err, "failed to write outcome marker");
             }
