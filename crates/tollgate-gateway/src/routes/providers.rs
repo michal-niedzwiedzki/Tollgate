@@ -9,6 +9,7 @@ use tollgate_core::db;
 use tollgate_core::error::ErrorBody;
 use tollgate_core::types::{Provider, Scheme};
 
+use crate::ssrf;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -114,6 +115,35 @@ pub async fn create_provider(
                 .into_response();
         }
     };
+
+    // Registration-time validation is necessary but not sufficient: DNS can change between
+    // registration and the moment a request actually proxies to this URL. The real defence is
+    // Task 4.3's pinned-IP connector, which resolves and validates again immediately before
+    // dialing. This check only keeps an obviously unsafe URL out of the registry in the first
+    // place.
+    let (host, port) = match ssrf::validate_url(&body.upstream_url) {
+        Ok(hp) => hp,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody::new(
+                    "unsafe_upstream",
+                    format!("upstream resolves to a disallowed address: {e}"),
+                )),
+            )
+                .into_response();
+        }
+    };
+    if let Err(e) = ssrf::resolve_and_validate(&host, port).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody::new(
+                "unsafe_upstream",
+                format!("upstream resolves to a disallowed address: {e}"),
+            )),
+        )
+            .into_response();
+    }
 
     let provider = Provider {
         slug: body.slug,

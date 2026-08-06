@@ -5,17 +5,17 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-// Everything below carrying `allow(dead_code)` gains its production caller in Task 4.2
-// (provider registration) and Task 4.3 (the pinned-IP connector). The attributes come
-// off as each one gains that caller.
-
 /// The one flag that must never be `true` in a deployed config: it exists purely so the local mock
 /// upstream (`127.0.0.1:9000`) is reachable during development and tests. Default is unset/false.
-#[allow(dead_code)]
 const ALLOW_LOOPBACK_ENV: &str = "TOLLGATE_ALLOW_LOOPBACK_UPSTREAM";
 
+fn loopback_allowed() -> bool {
+    std::env::var(ALLOW_LOOPBACK_ENV)
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum SsrfError {
     #[error("host resolves to a private (RFC 1918) address: {0}")]
     PrivateNetwork(IpAddr),
@@ -50,7 +50,6 @@ pub enum SsrfError {
 /// Resolves `host:port` through the system resolver (documented as needing to be a public
 /// resolver, not an internal one, in deployment) and rejects if any resolved address is
 /// disallowed. Returns every validated address; the caller picks one to dial (Task 4.3).
-#[allow(dead_code)]
 pub async fn resolve_and_validate(host: &str, port: u16) -> Result<Vec<SocketAddr>, SsrfError> {
     // IPv6 literals need bracketing to form a valid "host:port" lookup query; a bare domain or
     // IPv4 literal does not.
@@ -69,9 +68,7 @@ pub async fn resolve_and_validate(host: &str, port: u16) -> Result<Vec<SocketAdd
         return Err(SsrfError::NoAddresses);
     }
 
-    let allow_loopback = std::env::var(ALLOW_LOOPBACK_ENV)
-        .map(|v| v == "true")
-        .unwrap_or(false);
+    let allow_loopback = loopback_allowed();
 
     for addr in &addrs {
         validate_ip(addr.ip(), allow_loopback)?;
@@ -83,7 +80,6 @@ pub async fn resolve_and_validate(host: &str, port: u16) -> Result<Vec<SocketAdd
 /// The address-level check, split out from resolution so it can be exercised directly against a
 /// hand-built address list — including a deliberate mix of public and private addresses — without
 /// depending on what a real DNS server happens to return.
-#[allow(dead_code)]
 fn validate_ip(ip: IpAddr, allow_loopback: bool) -> Result<(), SsrfError> {
     match ip {
         IpAddr::V4(v4) => validate_ipv4(v4, allow_loopback),
@@ -99,7 +95,6 @@ fn validate_ip(ip: IpAddr, allow_loopback: bool) -> Result<(), SsrfError> {
     }
 }
 
-#[allow(dead_code)]
 fn validate_ipv4(v4: Ipv4Addr, allow_loopback: bool) -> Result<(), SsrfError> {
     let ip = IpAddr::V4(v4);
 
@@ -133,7 +128,6 @@ fn validate_ipv4(v4: Ipv4Addr, allow_loopback: bool) -> Result<(), SsrfError> {
     Ok(())
 }
 
-#[allow(dead_code)]
 fn validate_ipv6(v6: Ipv6Addr) -> Result<(), SsrfError> {
     let ip = IpAddr::V6(v6);
 
@@ -157,35 +151,36 @@ fn validate_ipv6(v6: Ipv6Addr) -> Result<(), SsrfError> {
 }
 
 /// 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16.
-#[allow(dead_code)]
 fn is_rfc1918(v4: Ipv4Addr) -> bool {
     let [a, b, ..] = v4.octets();
     a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168)
 }
 
 /// 100.64.0.0/10.
-#[allow(dead_code)]
 fn is_cgnat(v4: Ipv4Addr) -> bool {
     let [a, b, ..] = v4.octets();
     a == 100 && (64..=127).contains(&b)
 }
 
 /// fe80::/10.
-#[allow(dead_code)]
 fn is_link_local_v6(v6: Ipv6Addr) -> bool {
     (v6.segments()[0] & 0xffc0) == 0xfe80
 }
 
 /// fc00::/7.
-#[allow(dead_code)]
 fn is_unique_local_v6(v6: Ipv6Addr) -> bool {
     (v6.segments()[0] & 0xfe00) == 0xfc00
 }
 
 /// Reject non-http/https schemes and any URL with embedded credentials or a non-standard port
-/// outside 80/443. Returns the host and port to resolve. This runs before DNS resolution, since
-/// scheme/credential/port checks are cheap and don't need a network round trip.
-#[allow(dead_code)]
+/// outside 80/443, unless explicitly allowed by config. Returns the host and port to resolve.
+/// This runs before DNS resolution, since scheme/credential/port checks are cheap and don't need
+/// a network round trip.
+///
+/// The only config this MVP has for relaxing the port rule is `ALLOW_LOOPBACK_ENV`: its whole
+/// purpose (Task 4.1) is making the local mock upstream on `127.0.0.1:9000` reachable, and a
+/// flag that permits the loopback address but still blocks its non-standard port would not
+/// achieve that. The relaxation is scoped to the two loopback literals, not to arbitrary hosts.
 pub fn validate_url(raw: &str) -> Result<(String, u16), SsrfError> {
     let url = url::Url::parse(raw).map_err(|e| SsrfError::InvalidUrl(e.to_string()))?;
 
@@ -198,16 +193,17 @@ pub fn validate_url(raw: &str) -> Result<(String, u16), SsrfError> {
         return Err(SsrfError::CredentialsNotAllowed);
     }
 
-    let default_port = if url.scheme() == "https" { 443 } else { 80 };
-    let port = url.port().unwrap_or(default_port);
-    if port != 80 && port != 443 {
-        return Err(SsrfError::PortNotAllowed(port));
-    }
-
     let host = url
         .host_str()
         .ok_or_else(|| SsrfError::InvalidUrl("url has no host".to_string()))?
         .to_string();
+
+    let default_port = if url.scheme() == "https" { 443 } else { 80 };
+    let port = url.port().unwrap_or(default_port);
+    let is_loopback_literal = host == "127.0.0.1" || host == "::1";
+    if port != 80 && port != 443 && !(is_loopback_literal && loopback_allowed()) {
+        return Err(SsrfError::PortNotAllowed(port));
+    }
 
     Ok((host, port))
 }
