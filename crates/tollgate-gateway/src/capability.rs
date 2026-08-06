@@ -476,6 +476,753 @@ pub mod decode {
     }
 }
 
+/// Walking a decoded chain and enforcing architecture.md §5.2. Task 5.3.
+///
+/// This is the security core of the headline feature: everything that stops a sub-agent
+/// granting itself more than it holds, or a thief using a capability it did not earn, is
+/// here. The walk is root-first and returns on the first failure.
+pub mod verify {
+    use super::decode::{ChainLink, MAX_CHAIN_DEPTH};
+    use super::{recover_issuer, struct_hash};
+    use crate::policy::CapLevel;
+    use alloy::primitives::{Address, B256};
+    use std::collections::HashSet;
+    use tollgate_core::metrics::StageTimer;
+
+    /// Which attenuation rule a link broke. Carried on the error so the 400 can say what a
+    /// child over-claimed rather than just that it did.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Attenuated {
+        MaxTotal,
+        MaxPerRequest,
+        Expiry,
+        NotBefore,
+        MaxDepth,
+        Allowlist,
+    }
+
+    impl Attenuated {
+        pub fn field(&self) -> &'static str {
+            match self {
+                Self::MaxTotal => "maxTotal",
+                Self::MaxPerRequest => "maxPerRequest",
+                Self::Expiry => "expiry",
+                Self::NotBefore => "notBefore",
+                Self::MaxDepth => "maxDepth",
+                Self::Allowlist => "allowlist",
+            }
+        }
+    }
+
+    /// Why a link failed to chain to its parent. Both cases are malformed-chain errors, but
+    /// they fail for different reasons and a caller debugging one wants to know which.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Broken {
+        /// `issuer(i) != subject(i-1)`: someone spliced in a link the parent never granted.
+        IssuerNotParentSubject,
+        /// `parent(i) != hash(link i-1)`: the link points at a different capability.
+        ParentHashMismatch,
+        /// A root whose `parent` is not `0x0` is claiming a parent it did not present.
+        RootHasParent,
+    }
+
+    #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+    pub enum CapError {
+        #[error("capability chain is empty")]
+        EmptyChain,
+        #[error("capability chain depth {depth} exceeds the maximum of {max}", max = MAX_CHAIN_DEPTH)]
+        DepthExceeded { depth: usize },
+        #[error("link {index} signature does not recover to its declared issuer")]
+        BadSignature { index: usize },
+        #[error("link {index} does not chain to its parent")]
+        BrokenChain { index: usize, broken: Broken },
+        #[error("link {index} claims more {field} than its parent granted", field = violation.field())]
+        Attenuation { index: usize, violation: Attenuated },
+        #[error("the leaf capability's subject is not the signer of the payment")]
+        SubjectMismatch,
+        #[error("link {index} expired")]
+        Expired { index: usize },
+        #[error("link {index} is not yet valid")]
+        NotYetValid { index: usize },
+        #[error("link {index} has been revoked")]
+        Revoked { index: usize },
+        #[error("provider {slug} is not in the effective allowlist")]
+        ProviderNotAllowed { slug: String },
+    }
+
+    impl CapError {
+        /// architecture.md §4.3. The split is deliberate and worth stating: a chain that
+        /// over-claims is **400**, because a child claiming more than its parent granted is
+        /// a malformed chain rather than a policy decision — there is no budget under which
+        /// it would have been allowed. A chain that is well-formed but not permitted right
+        /// now (expired, revoked, wrong subject, wrong provider) is **403**.
+        pub fn status(&self) -> axum::http::StatusCode {
+            use axum::http::StatusCode;
+            match self {
+                Self::EmptyChain
+                | Self::DepthExceeded { .. }
+                | Self::BadSignature { .. }
+                | Self::BrokenChain { .. }
+                | Self::Attenuation { .. } => StatusCode::BAD_REQUEST,
+                Self::SubjectMismatch
+                | Self::Expired { .. }
+                | Self::NotYetValid { .. }
+                | Self::Revoked { .. }
+                | Self::ProviderNotAllowed { .. } => StatusCode::FORBIDDEN,
+            }
+        }
+
+        pub fn reason(&self) -> &'static str {
+            match self {
+                Self::EmptyChain => "empty_chain",
+                Self::DepthExceeded { .. } => "chain_too_deep",
+                Self::BadSignature { .. } => "bad_signature",
+                Self::BrokenChain { .. } => "broken_chain",
+                Self::Attenuation { .. } => "attenuation",
+                Self::SubjectMismatch => "subject_mismatch",
+                Self::Expired { .. } => "capability_expired",
+                Self::NotYetValid { .. } => "capability_not_yet_valid",
+                Self::Revoked { .. } => "capability_revoked",
+                Self::ProviderNotAllowed { .. } => "provider_not_allowed",
+            }
+        }
+    }
+
+    /// The allowlist in force at a given link. `None` is *unconstrained*, not *empty*.
+    ///
+    /// `allowlistHash == 0x0` means inherit. A root has nothing to inherit from, so a root
+    /// that inherits places no endpoint restriction at all. The alternative reading —
+    /// inherit-from-nothing means permit nothing — would make such a capability incapable of
+    /// authorising any request, which no issuer could intend; an issuer wanting to permit
+    /// nothing simply does not issue. Attenuation is unaffected either way: a child may
+    /// still only narrow, never widen.
+    type Effective<'a> = Option<&'a [String]>;
+
+    /// Verifies a decoded chain against architecture.md §5.2 and returns one `CapLevel` per
+    /// link, root first, ready for the claim script's variadic key list.
+    ///
+    /// `revoked` is pre-fetched by the caller (one `SMISMEMBER` for the whole chain) so this
+    /// stays a pure function of its inputs and needs no Redis connection to test.
+    pub fn verify_chain(
+        chain: &[ChainLink],
+        payment_signer: Address,
+        provider_slug: &str,
+        now: u64,
+        chain_id: u64,
+        revoked: &HashSet<B256>,
+    ) -> Result<Vec<CapLevel>, CapError> {
+        let _timer = StageTimer::start("capability");
+
+        if chain.is_empty() {
+            return Err(CapError::EmptyChain);
+        }
+        // Rule 1, re-asserted. Task 5.2's decode already refuses deeper chains before doing
+        // any per-link work; this is the belt to that braces, so a caller that assembles a
+        // chain by some other route cannot walk past the limit.
+        if chain.len() > MAX_CHAIN_DEPTH {
+            return Err(CapError::DepthExceeded { depth: chain.len() });
+        }
+
+        let mut hashes: Vec<B256> = Vec::with_capacity(chain.len());
+        let mut effective: Effective = None;
+
+        for (index, link) in chain.iter().enumerate() {
+            let capability = &link.capability;
+
+            // Rule 2. Everything after this trusts the link's contents, so it has to come
+            // first: an unsigned link's fields are attacker-controlled and comparing them
+            // would be meaningless.
+            let recovered = recover_issuer(capability, &link.signature, chain_id)
+                .map_err(|_| CapError::BadSignature { index })?;
+            if recovered != capability.issuer {
+                return Err(CapError::BadSignature { index });
+            }
+
+            // Rule 3.
+            match index.checked_sub(1) {
+                None => {
+                    if capability.parent != B256::ZERO {
+                        return Err(CapError::BrokenChain {
+                            index,
+                            broken: Broken::RootHasParent,
+                        });
+                    }
+                }
+                Some(parent_index) => {
+                    let parent = &chain[parent_index].capability;
+                    if capability.issuer != parent.subject {
+                        return Err(CapError::BrokenChain {
+                            index,
+                            broken: Broken::IssuerNotParentSubject,
+                        });
+                    }
+                    if capability.parent != hashes[parent_index] {
+                        return Err(CapError::BrokenChain {
+                            index,
+                            broken: Broken::ParentHashMismatch,
+                        });
+                    }
+
+                    // Rule 4. A capability can never grant more than it holds.
+                    let violation = if capability.maxTotal > parent.maxTotal {
+                        Some(Attenuated::MaxTotal)
+                    } else if capability.maxPerRequest > parent.maxPerRequest {
+                        Some(Attenuated::MaxPerRequest)
+                    } else if capability.expiry > parent.expiry {
+                        Some(Attenuated::Expiry)
+                    } else if capability.notBefore < parent.notBefore {
+                        Some(Attenuated::NotBefore)
+                    } else if capability.maxDepth >= parent.maxDepth {
+                        Some(Attenuated::MaxDepth)
+                    } else if !is_subset(link_allowlist(link), effective) {
+                        Some(Attenuated::Allowlist)
+                    } else {
+                        None
+                    };
+                    if let Some(violation) = violation {
+                        return Err(CapError::Attenuation { index, violation });
+                    }
+                }
+            }
+
+            // Rule 7.
+            if now < capability.notBefore {
+                return Err(CapError::NotYetValid { index });
+            }
+            if now > capability.expiry {
+                return Err(CapError::Expired { index });
+            }
+
+            let hash = struct_hash(capability);
+            // Rule 6.
+            if revoked.contains(&hash) {
+                return Err(CapError::Revoked { index });
+            }
+            hashes.push(hash);
+
+            // A link that inherits carries the allowlist down unchanged.
+            if let Some(declared) = link_allowlist(link) {
+                effective = Some(declared);
+            }
+        }
+
+        // Rule 5. This is what makes a stolen capability useless: holding the bytes is not
+        // enough, the thief would need the subject's key to sign the payment as well.
+        let leaf = &chain[chain.len() - 1].capability;
+        if leaf.subject != payment_signer {
+            return Err(CapError::SubjectMismatch);
+        }
+
+        // Rule 8, against the effective allowlist: the leaf's, or the nearest ancestor's
+        // that declared one.
+        if let Some(allowed) = effective
+            && !allowed.iter().any(|slug| slug == provider_slug)
+        {
+            return Err(CapError::ProviderNotAllowed {
+                slug: provider_slug.to_string(),
+            });
+        }
+
+        Ok(hashes
+            .into_iter()
+            .map(|hash| CapLevel {
+                cap_hash: hash.to_string(),
+            })
+            .collect())
+    }
+
+    fn link_allowlist(link: &ChainLink) -> Effective<'_> {
+        if link.allowlist.is_empty() {
+            None
+        } else {
+            Some(&link.allowlist)
+        }
+    }
+
+    /// A child that declares nothing inherits, which is trivially a subset. A child that
+    /// declares slugs must not name one its parent lacks — and a parent that is
+    /// unconstrained permits any narrowing.
+    fn is_subset(child: Effective, parent: Effective) -> bool {
+        match (child, parent) {
+            (None, _) => true,
+            (Some(_), None) => true,
+            (Some(child), Some(parent)) => child.iter().all(|slug| parent.contains(slug)),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::capability::decode::decode_capability_chain;
+        use crate::capability::{allowlist_hash, signing_hash, Capability};
+        use alloy::primitives::Signature;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine;
+        use k256::ecdsa::SigningKey;
+        use serde_json::{json, Value};
+        use std::str::FromStr;
+
+        const CHAIN_ID: u64 = 84532;
+        /// Inside every fixture link's `[notBefore, expiry]` window.
+        const NOW: u64 = 1_720_000_000;
+
+        const VECTORS: &str =
+            include_str!("../tests/fixtures/capability_vectors.json");
+
+        fn fixture() -> Vec<Value> {
+            let vectors: Value = serde_json::from_str(VECTORS).expect("fixture should parse");
+            vectors["capabilities"]
+                .as_array()
+                .expect("fixture should hold a capabilities array")
+                .clone()
+        }
+
+        fn key_from(hex: &str) -> SigningKey {
+            let bytes = B256::from_str(hex).expect("key should be 32 bytes of hex");
+            SigningKey::from_slice(bytes.as_slice()).expect("key should be a valid scalar")
+        }
+
+        /// The three signing keys the fixture ships, root first.
+        fn fixture_keys() -> Vec<SigningKey> {
+            fixture()
+                .iter()
+                .map(|link| key_from(link["signerPrivateKey"].as_str().expect("key present")))
+                .collect()
+        }
+
+        fn address_of(key: &SigningKey) -> Address {
+            Address::from_public_key(key.verifying_key())
+        }
+
+        fn sign(capability: &Capability, key: &SigningKey) -> alloy::primitives::Bytes {
+            let hash = signing_hash(capability, CHAIN_ID);
+            let (raw, recid) = key
+                .sign_prehash_recoverable(hash.as_slice())
+                .expect("signing a prehash should succeed");
+            Signature::from_signature_and_parity(raw, recid.is_y_odd())
+                .as_bytes()
+                .to_vec()
+                .into()
+        }
+
+        /// Decodes the fixture, applies `mutate`, then repairs every `parent` pointer and
+        /// re-signs every link with its own key.
+        ///
+        /// The resealing is what makes these tests test what they claim. Rules 2 and 3 run
+        /// before rule 4, so a chain mutated in place would fail on its stale signature or
+        /// its stale parent hash and never reach the attenuation check — the test would pass
+        /// for entirely the wrong reason. Resealing models the real threat: an issuer who
+        /// signs an over-claiming capability perfectly correctly.
+        fn sealed_chain(mutate: impl FnOnce(&mut Vec<Value>)) -> Vec<ChainLink> {
+            let mut links = fixture();
+            mutate(&mut links);
+
+            let header = BASE64.encode(serde_json::to_vec(&json!(links)).unwrap());
+            let mut chain = decode_capability_chain(&header).expect("mutation must stay decodable");
+
+            let keys = fixture_keys();
+            for index in 0..chain.len() {
+                chain[index].capability.parent = match index.checked_sub(1) {
+                    None => B256::ZERO,
+                    Some(parent) => struct_hash(&chain[parent].capability),
+                };
+                chain[index].signature = sign(&chain[index].capability, &keys[index]);
+            }
+            chain
+        }
+
+        /// The leaf's subject, which is who must have signed the payment.
+        fn leaf_subject(chain: &[ChainLink]) -> Address {
+            chain[chain.len() - 1].capability.subject
+        }
+
+        fn verify(chain: &[ChainLink]) -> Result<Vec<CapLevel>, CapError> {
+            verify_chain(
+                chain,
+                leaf_subject(chain),
+                "geocode",
+                NOW,
+                CHAIN_ID,
+                &HashSet::new(),
+            )
+        }
+
+        #[test]
+        fn a_valid_three_link_chain_passes_and_returns_a_level_per_link() {
+            let chain = sealed_chain(|_| {});
+            let levels = verify(&chain).expect("the fixture chain should verify");
+
+            assert_eq!(levels.len(), 3, "one level per link, root first");
+            for (index, level) in levels.iter().enumerate() {
+                assert_eq!(
+                    level.cap_hash,
+                    struct_hash(&chain[index].capability).to_string(),
+                    "level {index} must be keyed by that link's struct hash"
+                );
+            }
+        }
+
+        #[test]
+        fn child_max_total_above_parent_is_an_attenuation_violation() {
+            let chain = sealed_chain(|links| {
+                links[1]["capability"]["maxTotal"] = json!("2000000");
+            });
+            let err = verify(&chain).unwrap_err();
+            assert_eq!(
+                err,
+                CapError::Attenuation {
+                    index: 1,
+                    violation: Attenuated::MaxTotal
+                }
+            );
+            assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+            assert_eq!(err.reason(), "attenuation");
+        }
+
+        #[test]
+        fn child_max_per_request_above_parent_is_an_attenuation_violation() {
+            let chain = sealed_chain(|links| {
+                links[1]["capability"]["maxPerRequest"] = json!("60000");
+            });
+            assert_eq!(
+                verify(&chain).unwrap_err(),
+                CapError::Attenuation {
+                    index: 1,
+                    violation: Attenuated::MaxPerRequest
+                }
+            );
+        }
+
+        #[test]
+        fn child_expiry_beyond_parent_is_an_attenuation_violation() {
+            let chain = sealed_chain(|links| {
+                links[1]["capability"]["expiry"] = json!(1_900_000_000u64);
+            });
+            let err = verify(&chain).unwrap_err();
+            assert_eq!(
+                err,
+                CapError::Attenuation {
+                    index: 1,
+                    violation: Attenuated::Expiry
+                }
+            );
+            assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+        }
+
+        #[test]
+        fn child_not_before_earlier_than_parent_is_an_attenuation_violation() {
+            let chain = sealed_chain(|links| {
+                links[1]["capability"]["notBefore"] = json!(1_600_000_000u64);
+            });
+            assert_eq!(
+                verify(&chain).unwrap_err(),
+                CapError::Attenuation {
+                    index: 1,
+                    violation: Attenuated::NotBefore
+                }
+            );
+        }
+
+        #[test]
+        fn child_max_depth_not_below_parent_is_an_attenuation_violation() {
+            // Equal is a violation too: maxDepth must strictly decrease, or a chain could
+            // extend itself forever.
+            let chain = sealed_chain(|links| {
+                links[1]["capability"]["maxDepth"] = json!(3);
+            });
+            assert_eq!(
+                verify(&chain).unwrap_err(),
+                CapError::Attenuation {
+                    index: 1,
+                    violation: Attenuated::MaxDepth
+                }
+            );
+        }
+
+        #[test]
+        fn child_allowlist_adding_a_slug_the_parent_lacks_is_an_attenuation_violation() {
+            // Properly signed and self-consistent — the hash matches the slugs — so this is
+            // caught by attenuation, not by decode.
+            let widened = vec![
+                "geocode".to_string(),
+                "weather".to_string(),
+                "smuggled".to_string(),
+            ];
+            let chain = sealed_chain(|links| {
+                links[1]["allowlist"] = json!(widened);
+                links[1]["capability"]["allowlistHash"] =
+                    json!(allowlist_hash(&widened).to_string());
+            });
+            let err = verify(&chain).unwrap_err();
+            assert_eq!(
+                err,
+                CapError::Attenuation {
+                    index: 1,
+                    violation: Attenuated::Allowlist
+                }
+            );
+            assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+        }
+
+        #[test]
+        fn link_issuer_not_matching_the_parent_subject_breaks_the_chain() {
+            // Re-signed by the impostor, so the signature is valid and rule 2 passes: the
+            // failure has to come from rule 3.
+            let impostor = key_from(
+                "0x5555555555555555555555555555555555555555555555555555555555555555",
+            );
+            let mut chain = sealed_chain(|_| {});
+            chain[1].capability.issuer = address_of(&impostor);
+            chain[1].signature = sign(&chain[1].capability, &impostor);
+
+            let err = verify(&chain).unwrap_err();
+            assert_eq!(
+                err,
+                CapError::BrokenChain {
+                    index: 1,
+                    broken: Broken::IssuerNotParentSubject
+                }
+            );
+            assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+            assert_eq!(err.reason(), "broken_chain");
+        }
+
+        #[test]
+        fn link_parent_not_matching_the_previous_hash_breaks_the_chain() {
+            let mut chain = sealed_chain(|_| {});
+            let keys = fixture_keys();
+            chain[1].capability.parent = B256::from([0xaa; 32]);
+            chain[1].signature = sign(&chain[1].capability, &keys[1]);
+
+            assert_eq!(
+                verify(&chain).unwrap_err(),
+                CapError::BrokenChain {
+                    index: 1,
+                    broken: Broken::ParentHashMismatch
+                }
+            );
+        }
+
+        #[test]
+        fn a_root_claiming_a_parent_breaks_the_chain() {
+            let mut chain = sealed_chain(|_| {});
+            let keys = fixture_keys();
+            chain[0].capability.parent = B256::from([0xbb; 32]);
+            chain[0].signature = sign(&chain[0].capability, &keys[0]);
+
+            assert_eq!(
+                verify(&chain).unwrap_err(),
+                CapError::BrokenChain {
+                    index: 0,
+                    broken: Broken::RootHasParent
+                }
+            );
+        }
+
+        #[test]
+        fn a_leaf_subject_that_did_not_sign_the_payment_is_refused() {
+            let chain = sealed_chain(|_| {});
+            let thief = key_from(
+                "0x6666666666666666666666666666666666666666666666666666666666666666",
+            );
+
+            // The whole chain is valid; it is simply being presented by someone else. This
+            // is the stolen-capability case from architecture.md §10.
+            let err = verify_chain(
+                &chain,
+                address_of(&thief),
+                "geocode",
+                NOW,
+                CHAIN_ID,
+                &HashSet::new(),
+            )
+            .unwrap_err();
+
+            assert_eq!(err, CapError::SubjectMismatch);
+            assert_eq!(err.status(), axum::http::StatusCode::FORBIDDEN);
+            assert_eq!(err.reason(), "subject_mismatch");
+        }
+
+        #[test]
+        fn an_expired_link_is_refused() {
+            let chain = sealed_chain(|_| {});
+            // The leaf expires at 1_750_000_000; a moment past that must not spend.
+            let err = verify_chain(
+                &chain,
+                leaf_subject(&chain),
+                "geocode",
+                1_750_000_001,
+                CHAIN_ID,
+                &HashSet::new(),
+            )
+            .unwrap_err();
+
+            assert_eq!(err, CapError::Expired { index: 2 });
+            assert_eq!(err.status(), axum::http::StatusCode::FORBIDDEN);
+            assert_eq!(err.reason(), "capability_expired");
+        }
+
+        #[test]
+        fn a_link_presented_before_its_not_before_is_refused() {
+            let chain = sealed_chain(|_| {});
+            let err = verify_chain(
+                &chain,
+                leaf_subject(&chain),
+                "geocode",
+                1_600_000_000,
+                CHAIN_ID,
+                &HashSet::new(),
+            )
+            .unwrap_err();
+
+            assert_eq!(err, CapError::NotYetValid { index: 0 });
+            assert_eq!(err.status(), axum::http::StatusCode::FORBIDDEN);
+        }
+
+        #[test]
+        fn a_revoked_link_is_refused_and_revoking_a_parent_blocks_the_child() {
+            let chain = sealed_chain(|_| {});
+
+            // Revoking the leaf refuses the leaf.
+            let leaf_hash = struct_hash(&chain[2].capability);
+            let err = verify_chain(
+                &chain,
+                leaf_subject(&chain),
+                "geocode",
+                NOW,
+                CHAIN_ID,
+                &HashSet::from([leaf_hash]),
+            )
+            .unwrap_err();
+            assert_eq!(err, CapError::Revoked { index: 2 });
+            assert_eq!(err.status(), axum::http::StatusCode::FORBIDDEN);
+            assert_eq!(err.reason(), "capability_revoked");
+
+            // Revoking the *root* refuses the leaf too, and names the root: the child's
+            // authority is only ever borrowed from its ancestors.
+            let root_hash = struct_hash(&chain[0].capability);
+            let err = verify_chain(
+                &chain,
+                leaf_subject(&chain),
+                "geocode",
+                NOW,
+                CHAIN_ID,
+                &HashSet::from([root_hash]),
+            )
+            .unwrap_err();
+            assert_eq!(err, CapError::Revoked { index: 0 });
+        }
+
+        #[test]
+        fn a_provider_outside_the_effective_allowlist_is_refused() {
+            let chain = sealed_chain(|_| {});
+            // The leaf narrowed to ["geocode"], so weather is no longer reachable even
+            // though its ancestors both permit it.
+            let err = verify_chain(
+                &chain,
+                leaf_subject(&chain),
+                "weather",
+                NOW,
+                CHAIN_ID,
+                &HashSet::new(),
+            )
+            .unwrap_err();
+
+            assert_eq!(
+                err,
+                CapError::ProviderNotAllowed {
+                    slug: "weather".to_string()
+                }
+            );
+            assert_eq!(err.status(), axum::http::StatusCode::FORBIDDEN);
+            assert_eq!(err.reason(), "provider_not_allowed");
+        }
+
+        /// A leaf with `allowlistHash == 0x0` inherits, so the nearest ancestor that
+        /// declared one governs — rule 8's "or the nearest ancestor's if the leaf inherits".
+        #[test]
+        fn an_inheriting_leaf_uses_the_nearest_ancestor_allowlist() {
+            let chain = sealed_chain(|links| {
+                links[2]["allowlist"] = json!([]);
+                links[2]["capability"]["allowlistHash"] = json!(B256::ZERO.to_string());
+            });
+
+            // The lead declared ["geocode", "weather"], so weather is reachable again.
+            verify_chain(&chain, leaf_subject(&chain), "weather", NOW, CHAIN_ID, &HashSet::new())
+                .expect("an inheriting leaf takes its ancestor's allowlist");
+
+            // And a slug no ancestor ever declared is still refused.
+            let err = verify_chain(
+                &chain,
+                leaf_subject(&chain),
+                "elsewhere",
+                NOW,
+                CHAIN_ID,
+                &HashSet::new(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                CapError::ProviderNotAllowed {
+                    slug: "elsewhere".to_string()
+                }
+            );
+        }
+
+        #[test]
+        fn a_link_whose_signature_does_not_recover_to_its_issuer_is_refused() {
+            let mut chain = sealed_chain(|_| {});
+            // Signed by the wrong key: the recovered address is somebody else's.
+            let wrong = key_from(
+                "0x7777777777777777777777777777777777777777777777777777777777777777",
+            );
+            chain[1].signature = sign(&chain[1].capability, &wrong);
+
+            let err = verify(&chain).unwrap_err();
+            assert_eq!(err, CapError::BadSignature { index: 1 });
+            assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+            assert_eq!(err.reason(), "bad_signature");
+        }
+
+        #[test]
+        fn an_empty_chain_is_refused() {
+            let err = verify_chain(
+                &[],
+                Address::ZERO,
+                "geocode",
+                NOW,
+                CHAIN_ID,
+                &HashSet::new(),
+            )
+            .unwrap_err();
+            assert_eq!(err, CapError::EmptyChain);
+            assert_eq!(err.status(), axum::http::StatusCode::BAD_REQUEST);
+        }
+
+        /// Rule 1 is re-asserted here even though decode already enforces it, so a chain
+        /// assembled by some other route cannot walk past the limit.
+        #[test]
+        fn depth_is_re_asserted_independently_of_decode() {
+            let chain = sealed_chain(|_| {});
+            let mut deep = chain.clone();
+            while deep.len() <= MAX_CHAIN_DEPTH {
+                deep.push(chain[2].clone());
+            }
+
+            let err = verify_chain(
+                &deep,
+                leaf_subject(&deep),
+                "geocode",
+                NOW,
+                CHAIN_ID,
+                &HashSet::new(),
+            )
+            .unwrap_err();
+            assert_eq!(err, CapError::DepthExceeded { depth: 5 });
+        }
+    }
+}
+
 #[cfg(test)]
 mod hash {
     use super::*;
