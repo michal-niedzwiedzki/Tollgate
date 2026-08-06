@@ -405,11 +405,18 @@ mod outcome_race {
         format!("0x{nanos:064x}")
     }
 
+    /// The payout address must be a full 20 bytes. A shorter one inserts fine —
+    /// the column is a bare `BYTEA` — but then every later `list_providers` call
+    /// fails to decode the whole table, which took out an unrelated
+    /// `tollgate-core` test for as long as the row survived. This helper never
+    /// deletes the row (its three tests run concurrently and share it), so
+    /// `DO UPDATE` is what repairs a database that already holds the old
+    /// malformed one.
     async fn ensure_provider(pg: &PgPool) {
         sqlx::query(
             "INSERT INTO providers (slug, upstream_url, price_wei, payout_address)
-             VALUES ($1, 'http://127.0.0.1:9000', 1000::NUMERIC, '\\x01')
-             ON CONFLICT (slug) DO NOTHING",
+             VALUES ($1, 'http://127.0.0.1:9000', 1000::NUMERIC, '\\x00000000000000000000000000000000000000a1')
+             ON CONFLICT (slug) DO UPDATE SET payout_address = EXCLUDED.payout_address",
         )
         .bind(TEST_SLUG)
         .execute(pg)
