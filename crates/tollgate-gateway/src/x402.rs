@@ -143,9 +143,36 @@ pub mod decode {
         from: String,
         to: String,
         value: String,
-        valid_after: u64,
-        valid_before: u64,
+        valid_after: NumericField,
+        valid_before: NumericField,
         nonce: String,
+    }
+
+    /// x402 serialises the authorisation's numeric fields as decimal strings —
+    /// the same convention `value` uses here and `maxAmountRequired` uses in the
+    /// 402 response this gateway emits. Typing `validAfter`/`validBefore` as a
+    /// bare `u64` therefore rejected every spec-shaped header with a serde type
+    /// error before any field validation could name a reason, which defeated the
+    /// interop claim in `architecture.md` §4.1.
+    ///
+    /// Both forms are accepted and normalised to `u64`: the string form because
+    /// it is the spec's, and the JSON-number form because some clients emit it
+    /// and being lenient here costs nothing. `value` and `nonce` stay
+    /// string-only, since neither survives a JSON number intact.
+    #[derive(Debug, Deserialize)]
+    #[serde(untagged)]
+    enum NumericField {
+        Str(String),
+        Num(u64),
+    }
+
+    impl NumericField {
+        fn parse_u64(&self, field: &str) -> Result<u64, X402Error> {
+            match self {
+                NumericField::Str(s) => parse_field::<u64>(field, s),
+                NumericField::Num(n) => Ok(*n),
+            }
+        }
     }
 
     fn parse_field<T>(field: &str, value: &str) -> Result<T, X402Error>
@@ -190,6 +217,16 @@ pub mod decode {
             "payload.authorization.nonce",
             &raw.payload.authorization.nonce,
         )?;
+        let valid_after = raw
+            .payload
+            .authorization
+            .valid_after
+            .parse_u64("payload.authorization.validAfter")?;
+        let valid_before = raw
+            .payload
+            .authorization
+            .valid_before
+            .parse_u64("payload.authorization.validBefore")?;
 
         Ok(PaymentPayload {
             x402_version: raw.x402_version,
@@ -201,8 +238,8 @@ pub mod decode {
                     from,
                     to,
                     value,
-                    valid_after: raw.payload.authorization.valid_after,
-                    valid_before: raw.payload.authorization.valid_before,
+                    valid_after,
+                    valid_before,
                     nonce,
                 },
             },
@@ -225,8 +262,12 @@ pub mod decode {
                         "from": "0x0101010101010101010101010101010101010101",
                         "to": "0x0202020202020202020202020202020202020202",
                         "value": "1000",
-                        "validAfter": 0,
-                        "validBefore": 9_999_999_999u64,
+                        // Strings, not JSON numbers: this is the shape x402
+                        // itself specifies and the one an off-the-shelf client
+                        // sends. `decodes_json_number_timestamps` covers the
+                        // other form.
+                        "validAfter": "0",
+                        "validBefore": "9999999999",
                         "nonce": format!("0x{}", "cd".repeat(32)),
                     }
                 }
@@ -263,6 +304,35 @@ pub mod decode {
             assert_eq!(
                 payload.payload.authorization.nonce,
                 B256::from_str(&format!("0x{}", "cd".repeat(32))).unwrap()
+            );
+        }
+
+        /// The lenient half of the same rule: a client emitting `validAfter` /
+        /// `validBefore` as JSON numbers is still accepted, and decodes to the
+        /// identical value as the string form.
+        #[test]
+        fn decodes_json_number_timestamps() {
+            let mut json = valid_json();
+            json["payload"]["authorization"]["validAfter"] = serde_json::json!(0);
+            json["payload"]["authorization"]["validBefore"] = serde_json::json!(9_999_999_999u64);
+
+            let payload =
+                decode_payment_header(&encode(&json)).expect("numeric timestamps should decode");
+
+            assert_eq!(payload.payload.authorization.valid_after, 0);
+            assert_eq!(payload.payload.authorization.valid_before, 9_999_999_999u64);
+        }
+
+        /// A non-numeric timestamp must name its own field rather than failing
+        /// as an opaque JSON type error, so the 402 tells the client what to fix.
+        #[test]
+        fn non_numeric_timestamp_is_a_malformed_field() {
+            let mut json = valid_json();
+            json["payload"]["authorization"]["validBefore"] =
+                serde_json::Value::String("soon".to_string());
+            let err = decode_payment_header(&encode(&json)).unwrap_err();
+            assert!(
+                matches!(err, X402Error::MalformedField { field, .. } if field == "payload.authorization.validBefore")
             );
         }
 
