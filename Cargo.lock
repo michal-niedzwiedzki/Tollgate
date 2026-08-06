@@ -5324,6 +5324,7 @@ dependencies = [
  "tollgate-core",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
