@@ -69,6 +69,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/providers/{slug}", get(routes::providers::get_provider))
         .route("/v1/budgets", post(routes::budgets::seed_budget))
         .route(
+            "/v1/capabilities/{hash}",
+            get(routes::capabilities::get_capability),
+        )
+        .route(
+            "/v1/capabilities/{hash}/revoke",
+            post(routes::capabilities::revoke_capability),
+        )
+        .route(
             "/v1/proxy/{provider_slug}/{*path}",
             any(routes::proxy::handle_proxy_request),
         )

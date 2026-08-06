@@ -67,6 +67,15 @@ pub struct CapabilityRecord {
     pub signature: Vec<u8>,
 }
 
+/// A capability as stored, read back for `GET /v1/capabilities/{hash}` and for the
+/// revocation authorisation check (Task 5.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredCapability {
+    pub capability: CapabilityRecord,
+    /// RFC 3339, read via a `::TEXT` cast so no date-time dependency is needed to serve it.
+    pub revoked_at: Option<String>,
+}
+
 /// Parses a Postgres `NUMERIC` value (read back via a `::TEXT` cast) into a `U256`.
 pub fn numeric_to_u256(s: &str) -> Result<U256> {
     U256::from_str_radix(s, 10).map_err(|e| Error::InvalidNumeric(e.to_string()))
@@ -75,6 +84,17 @@ pub fn numeric_to_u256(s: &str) -> Result<U256> {
 /// Formats a `U256` for binding into a Postgres `NUMERIC` column (via a `::NUMERIC` cast).
 pub fn u256_to_numeric(v: U256) -> String {
     v.to_string()
+}
+
+/// Decodes a Postgres `BYTEA` value into a `B256`. Fails unless it is exactly 32 bytes.
+pub fn bytea_to_b256(bytes: &[u8]) -> Result<B256> {
+    if bytes.len() != 32 {
+        return Err(Error::InvalidNumeric(format!(
+            "expected a 32-byte hash, got {}",
+            bytes.len()
+        )));
+    }
+    Ok(B256::from_slice(bytes))
 }
 
 /// Decodes a Postgres `BYTEA` value into an `Address`. Fails unless it is exactly 20 bytes.

@@ -208,6 +208,38 @@ def cmd_chain(args):
     print(base64.b64encode(json.dumps(links).encode()).decode())
 
 
+def cmd_revoke(args):
+    """Signs an EIP-712 Revocation and emits the POST body for
+    /v1/capabilities/{hash}/revoke. Signed under the same Tollgate domain as a capability."""
+    issued_at = args.issued_at if args.issued_at is not None else int(time.time())
+    full_message = {
+        "types": {
+            "EIP712Domain": [
+                {"name": "name", "type": "string"},
+                {"name": "version", "type": "string"},
+                {"name": "chainId", "type": "uint256"},
+            ],
+            "Revocation": [
+                {"name": "capabilityHash", "type": "bytes32"},
+                {"name": "issuedAt", "type": "uint64"},
+            ],
+        },
+        "primaryType": "Revocation",
+        "domain": {"name": "Tollgate", "version": "1", "chainId": args.chain_id},
+        "message": {"capabilityHash": args.hash, "issuedAt": issued_at},
+    }
+    signature = Account.sign_message(signable(full_message), args.key).signature
+    print(
+        json.dumps(
+            {
+                "capability_hash": args.hash,
+                "issued_at": issued_at,
+                "signature": "0x" + signature.hex(),
+            }
+        )
+    )
+
+
 def cmd_payment(args):
     """Signs an EIP-3009 transferWithAuthorization and emits the base64 X-PAYMENT header."""
     now = int(time.time())
@@ -274,6 +306,13 @@ def main():
     p.add_argument("--chain-id", type=int, default=84532)
     p.add_argument("--hashes", action="store_true")
     p.set_defaults(func=cmd_chain)
+
+    p = sub.add_parser("revoke")
+    p.add_argument("--key", required=True)
+    p.add_argument("--hash", required=True)
+    p.add_argument("--chain-id", type=int, default=84532)
+    p.add_argument("--issued-at", type=int)
+    p.set_defaults(func=cmd_revoke)
 
     p = sub.add_parser("payment")
     p.add_argument("--key", required=True)

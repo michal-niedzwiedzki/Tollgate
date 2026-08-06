@@ -2,13 +2,14 @@ use std::time::Duration;
 
 use redis::aio::ConnectionManager;
 use sqlx::postgres::PgPoolOptions;
+use alloy::primitives::Address;
 use sqlx::PgPool;
 
 use crate::config::Config;
 use crate::error::Result;
 use crate::types::{
-    address_to_bytea, bytea_to_address, numeric_to_u256, u256_to_numeric, CapabilityRecord,
-    Provider, Scheme,
+    address_to_bytea, bytea_to_address, bytea_to_b256, numeric_to_u256, u256_to_numeric,
+    CapabilityRecord, Provider, Scheme, StoredCapability,
 };
 
 pub async fn pg_pool(cfg: &Config) -> Result<PgPool> {
@@ -121,6 +122,98 @@ pub async fn insert_capability(pool: &PgPool, capability: &CapabilityRecord) -> 
     .bind(&capability.signature)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+#[derive(sqlx::FromRow)]
+struct CapabilityRow {
+    hash: Vec<u8>,
+    issuer: Vec<u8>,
+    subject: Vec<u8>,
+    parent_hash: Option<Vec<u8>>,
+    depth: i32,
+    max_total_wei: String,
+    max_per_req_wei: String,
+    allowlist: Option<Vec<String>>,
+    not_before: i64,
+    expiry: i64,
+    signature: Vec<u8>,
+    revoked_at: Option<String>,
+}
+
+impl TryFrom<CapabilityRow> for StoredCapability {
+    type Error = crate::error::Error;
+
+    fn try_from(row: CapabilityRow) -> Result<Self> {
+        Ok(StoredCapability {
+            capability: CapabilityRecord {
+                hash: bytea_to_b256(&row.hash)?,
+                issuer: bytea_to_address(&row.issuer)?,
+                subject: bytea_to_address(&row.subject)?,
+                parent_hash: row.parent_hash.as_deref().map(bytea_to_b256).transpose()?,
+                depth: row.depth,
+                max_total_wei: numeric_to_u256(&row.max_total_wei)?,
+                max_per_req_wei: numeric_to_u256(&row.max_per_req_wei)?,
+                allowlist: row.allowlist,
+                not_before: row.not_before as u64,
+                expiry: row.expiry as u64,
+                signature: row.signature,
+            },
+            revoked_at: row.revoked_at,
+        })
+    }
+}
+
+/// `TIMESTAMPTZ` back to unix seconds, and `NUMERIC`/`TIMESTAMPTZ` to text, so reading a
+/// capability needs no date-time dependency in this crate.
+const CAPABILITY_COLUMNS: &str = "hash, issuer, subject, parent_hash, depth, \
+    max_total_wei::TEXT AS max_total_wei, max_per_req_wei::TEXT AS max_per_req_wei, \
+    allowlist, EXTRACT(EPOCH FROM not_before)::BIGINT AS not_before, \
+    EXTRACT(EPOCH FROM expiry)::BIGINT AS expiry, signature, \
+    revoked_at::TEXT AS revoked_at";
+
+pub async fn get_capability(pool: &PgPool, hash: &[u8]) -> Result<Option<StoredCapability>> {
+    let row: Option<CapabilityRow> = sqlx::query_as(&format!(
+        "SELECT {CAPABILITY_COLUMNS} FROM capabilities WHERE hash = $1"
+    ))
+    .bind(hash)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(StoredCapability::try_from).transpose()
+}
+
+/// Every address entitled to revoke `hash`: its own issuer, plus the issuer of every
+/// ancestor. architecture.md §5.2 makes a child's authority borrowed from its parent, so an
+/// ancestor that granted the authority can withdraw it.
+///
+/// One recursive walk up `parent_hash` rather than a query per level: the chain is at most
+/// four links, but a round trip each would put the database on a revocation's critical path
+/// for no reason.
+pub async fn capability_issuers(pool: &PgPool, hash: &[u8]) -> Result<Vec<Address>> {
+    let rows: Vec<(Vec<u8>,)> = sqlx::query_as(
+        "WITH RECURSIVE ancestry AS (
+             SELECT hash, issuer, parent_hash FROM capabilities WHERE hash = $1
+           UNION ALL
+             SELECT c.hash, c.issuer, c.parent_hash
+             FROM capabilities c JOIN ancestry a ON c.hash = a.parent_hash
+         )
+         SELECT issuer FROM ancestry",
+    )
+    .bind(hash)
+    .fetch_all(pool)
+    .await?;
+
+    rows.iter().map(|(issuer,)| bytea_to_address(issuer)).collect()
+}
+
+/// Stamps `revoked_at`. Idempotent: `WHERE revoked_at IS NULL` keeps the first revocation's
+/// timestamp rather than letting a replay move it forward.
+pub async fn mark_capability_revoked(pool: &PgPool, hash: &[u8]) -> Result<()> {
+    sqlx::query("UPDATE capabilities SET revoked_at = now() WHERE hash = $1 AND revoked_at IS NULL")
+        .bind(hash)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

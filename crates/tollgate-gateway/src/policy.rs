@@ -94,6 +94,16 @@ pub async fn upsert_capability_meta(
         .await
 }
 
+/// Adds a capability to the revocation set (Task 5.5). The member format must match what
+/// `fetch_revoked` queries: `B256`'s `Display`, i.e. `0x` and lowercase hex.
+pub async fn add_revoked(conn: &mut ConnectionManager, cap_hash: &str) -> RedisResult<()> {
+    redis::cmd("SADD")
+        .arg(REVOKED_KEY)
+        .arg(cap_hash)
+        .exec_async(conn)
+        .await
+}
+
 /// Which of `hashes` are revoked, in one round trip. `SMISMEMBER` rather than `SMEMBERS`:
 /// the revocation set grows without bound over a deployment's life and there is no reason to
 /// transfer it to answer a question about at most four hashes.

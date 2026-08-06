@@ -112,6 +112,38 @@ pub fn recover_issuer(
         .map_err(|e| CapabilityError::RecoveryFailed(e.to_string()))
 }
 
+sol! {
+    /// A signed request to revoke a capability (Task 5.5). Revocation is off-chain and
+    /// stored in a Redis set, which is sufficient because the gateway is the enforcement
+    /// point — nothing needs to reach a chain for a revocation to take effect
+    /// (architecture.md §5.2).
+    ///
+    /// `issuedAt` exists so a revocation is not an unbounded bearer token. It is signed
+    /// under the same Tollgate domain as a capability, so a revocation for one chain cannot
+    /// be replayed against a gateway on another.
+    #[derive(Debug)]
+    struct Revocation {
+        bytes32 capabilityHash;
+        uint64 issuedAt;
+    }
+}
+
+/// Recovers the address that signed a revocation. As with `recover_issuer`, this does not
+/// decide whether that address is *allowed* to revoke — the caller checks it against the
+/// capability's issuer and ancestors, which needs the database.
+pub fn recover_revoker(
+    revocation: &Revocation,
+    signature: &[u8],
+    chain_id: u64,
+) -> Result<Address, CapabilityError> {
+    let signature =
+        Signature::from_raw(signature).map_err(|e| CapabilityError::InvalidSignature(e.to_string()))?;
+
+    signature
+        .recover_address_from_prehash(&revocation.eip712_signing_hash(&domain(chain_id)))
+        .map_err(|e| CapabilityError::RecoveryFailed(e.to_string()))
+}
+
 /// Decoding the `X-Tollgate-Capability` header into an ordered chain. Task 5.2.
 ///
 /// Decode only: nothing here recovers a signature, checks an expiry, or compares a link

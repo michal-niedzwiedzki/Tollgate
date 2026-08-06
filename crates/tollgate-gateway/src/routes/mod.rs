@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use crate::state::AppState;
 
 pub mod budgets;
+pub mod capabilities;
 pub mod providers;
 pub mod proxy;
 
