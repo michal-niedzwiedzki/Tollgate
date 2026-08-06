@@ -5,6 +5,54 @@
 Things noticed during execution that are out of scope for the task that surfaced them.
 Not committed to the diff; recorded here per `CLAUDE.md`'s scope rule.
 
+### The ledger drain's startup replay wedges on a permanently-unprocessable entry
+
+**Found:** 2026-08-06, while re-verifying Phases 0–4 before starting Phase 5.
+
+`ledger::run` (`crates/tollgate-gateway/src/ledger.rs`) replays this consumer's pending list
+before reading new entries:
+
+```rust
+loop {
+    match read_group(&mut redis, "0", None).await {
+        Ok(entries) if entries.is_empty() => break,
+        Ok(entries) => apply_batch(&mut redis, &pg, entries).await,
+        ...
+    }
+}
+```
+
+`apply_batch` deliberately leaves an entry un-acked when it cannot be applied (Task 3.4: "log and
+continue; never let one bad entry stall the drain"). That is correct for the steady-state `>` loop,
+which always advances. It is **not** correct for this startup loop, which re-reads from `0` — the
+start of the pending list — every iteration. An entry that can never be applied is therefore
+redelivered forever, `read_group` never returns empty, the loop never breaks, and the drain never
+reaches the `>` loop at all. **No new reservation is written to Postgres for the remaining life of
+the process.**
+
+**Observed:** with 110 unprocessable entries in the PEL (left by the `policy::claim` integration
+tests, whose nonces are not hex), a gateway restart produced 600,700 identical error lines —
+the same 100 entries retried 6,007 times each — and six paid requests that returned 200 to the
+caller wrote zero rows. `authorisations` stayed at 4. The request path itself is unaffected:
+budget is claimed, the upstream is proxied, and the outcome marker is written; only the durable
+ledger write is lost.
+
+**Why this is not just test residue:** the test nonces are what filled the PEL here, but nothing
+about the wedge is test-specific. Any permanently-failing entry does it — a `provider_slug` whose
+row was deleted (FK violation), a payload a future migration cannot parse, a row hitting a new
+CHECK constraint. One such entry silently stops all ledger writes from the next restart onward.
+
+**Why deferred, not fixed:** out of scope for the two fixes requested (the x402 timestamp encoding
+and the malformed test payout address). The fix is a change to Task 3.4's code with a real design
+choice behind it — track the last-read id and page forward with `XREADGROUP ... <last_id>` instead
+of re-reading from `0`, or bound the replay to one pass and let the `>` loop own the rest — and it
+should be made deliberately rather than folded into an unrelated commit.
+
+**Effect if left as is:** Phase 5 inherits it. The Phase 5 Gate's `FLUSHALL` + restart item
+(Task 5.6) will pass, since `FLUSHALL` clears the PEL too, but any restart *without* a flush after
+a poison entry lands leaves the gateway silently not persisting charges. Clearing the current
+backlog with `XACK`, or a fresh `FLUSHALL`, restores normal operation until the next one.
+
 ### Request path is not tolerant of a Postgres outage
 
 **Found:** Phase 3 Gate, verifying "killing Postgres mid-run loses no reservations once it
