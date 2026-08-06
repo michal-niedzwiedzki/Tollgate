@@ -6,6 +6,10 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::signal;
 use tollgate_core::{db, Config};
 
+// Task 5.1 builds the capability type, its hash and issuer recovery; Task 5.2 decodes the
+// chain from the request header and Task 5.3 walks it. Nothing calls into it until then.
+#[allow(dead_code)]
+mod capability;
 mod ledger;
 mod policy;
 mod proxy;
