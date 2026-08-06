@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use serde::{Deserialize, Deserializer};
 
 use crate::error::{Error, Result};
@@ -42,6 +42,29 @@ pub struct Provider {
     pub scheme: Scheme,
     pub payout_address: Address,
     pub timeout_ms: i32,
+}
+
+/// One row of `capabilities`, written on a capability's first use (Task 5.4). The
+/// capability is self-describing and signed, so there is no registration step: presenting it
+/// is what records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityRecord {
+    pub hash: B256,
+    pub issuer: Address,
+    pub subject: Address,
+    /// `None` for a root. The column is a self-referencing foreign key, so a root must store
+    /// SQL NULL — the capability's own `parent` field is `0x0`, which is not a row and would
+    /// fail the constraint.
+    pub parent_hash: Option<B256>,
+    pub depth: i32,
+    pub max_total_wei: U256,
+    pub max_per_req_wei: U256,
+    /// `None` when the capability inherits its parent's allowlist (`allowlistHash == 0x0`).
+    pub allowlist: Option<Vec<String>>,
+    /// Unix seconds; stored as `TIMESTAMPTZ`.
+    pub not_before: u64,
+    pub expiry: u64,
+    pub signature: Vec<u8>,
 }
 
 /// Parses a Postgres `NUMERIC` value (read back via a `::TEXT` cast) into a `U256`.

@@ -7,7 +7,8 @@ use sqlx::PgPool;
 use crate::config::Config;
 use crate::error::Result;
 use crate::types::{
-    address_to_bytea, bytea_to_address, numeric_to_u256, u256_to_numeric, Provider, Scheme,
+    address_to_bytea, bytea_to_address, numeric_to_u256, u256_to_numeric, CapabilityRecord,
+    Provider, Scheme,
 };
 
 pub async fn pg_pool(cfg: &Config) -> Result<PgPool> {
@@ -91,6 +92,36 @@ pub async fn list_providers(pool: &PgPool) -> Result<Vec<Provider>> {
     .await?;
 
     rows.into_iter().map(Provider::try_from).collect()
+}
+
+/// Records a capability on its first use (Task 5.4). Idempotent: a capability presented on
+/// every request of a run inserts once and is a no-op thereafter.
+///
+/// Callers must insert **root first**. `parent_hash` is a self-referencing foreign key, so a
+/// child whose parent has not landed yet is rejected by the constraint.
+pub async fn insert_capability(pool: &PgPool, capability: &CapabilityRecord) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO capabilities
+           (hash, issuer, subject, parent_hash, depth, max_total_wei, max_per_req_wei,
+            allowlist, not_before, expiry, signature)
+         VALUES ($1, $2, $3, $4, $5, $6::NUMERIC, $7::NUMERIC, $8,
+                 TO_TIMESTAMP($9), TO_TIMESTAMP($10), $11)
+         ON CONFLICT (hash) DO NOTHING",
+    )
+    .bind(capability.hash.as_slice())
+    .bind(capability.issuer.as_slice())
+    .bind(capability.subject.as_slice())
+    .bind(capability.parent_hash.as_ref().map(|h| h.as_slice()))
+    .bind(capability.depth)
+    .bind(u256_to_numeric(capability.max_total_wei))
+    .bind(u256_to_numeric(capability.max_per_req_wei))
+    .bind(capability.allowlist.as_ref())
+    .bind(capability.not_before as f64)
+    .bind(capability.expiry as f64)
+    .bind(&capability.signature)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]

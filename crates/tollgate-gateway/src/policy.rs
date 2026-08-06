@@ -55,6 +55,93 @@ pub async fn seed_cap_meta(
         .await
 }
 
+/// The revocation set (architecture.md §5.2: revocation is off-chain, and that is
+/// sufficient because the gateway is the enforcement point). Members are capability struct
+/// hashes in `0x`-prefixed lowercase hex, the form `B256`'s `Display` produces.
+pub const REVOKED_KEY: &str = "tg:revoked";
+
+/// Writes a verified capability's own limits into `tg:cap:{hash}:meta` (Task 5.4). The
+/// capability is self-describing and signed, so presenting it is the only registration step
+/// there is — which is what makes `delegate()` a pure local signature with no server round
+/// trip (architecture.md §7.3).
+///
+/// **No TTL, deliberately.** `expiry` is written as an ordinary field for the boot rebuild
+/// and the dashboard, but the key does not expire: expiring `:meta` while `:spent` survived
+/// would orphan the counter, and an expired capability would then surface as the claim
+/// script's `missing_meta` rather than the 403 `capability_expired` architecture.md §4.3
+/// requires. Expiry is enforced ahead of the claim by `capability::verify::verify_chain`,
+/// which is the only place that can produce the right status code.
+///
+/// Must only be called on a chain that has already passed `verify_chain`: this writes the
+/// limits the claim script then enforces, so writing it for an unverified chain would let a
+/// caller install its own caps.
+pub async fn upsert_capability_meta(
+    conn: &mut ConnectionManager,
+    cap_hash: &str,
+    max_total: u128,
+    max_per_request: u128,
+    expiry: u64,
+) -> RedisResult<()> {
+    redis::cmd("HSET")
+        .arg(meta_key(cap_hash))
+        .arg("max_total")
+        .arg(max_total.to_string())
+        .arg("max_per_request")
+        .arg(max_per_request.to_string())
+        .arg("expiry")
+        .arg(expiry.to_string())
+        .exec_async(conn)
+        .await
+}
+
+/// Which of `hashes` are revoked, in one round trip. `SMISMEMBER` rather than `SMEMBERS`:
+/// the revocation set grows without bound over a deployment's life and there is no reason to
+/// transfer it to answer a question about at most four hashes.
+pub async fn fetch_revoked(
+    conn: &mut ConnectionManager,
+    hashes: &[String],
+) -> RedisResult<std::collections::HashSet<String>> {
+    if hashes.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+
+    let mut cmd = redis::cmd("SMISMEMBER");
+    cmd.arg(REVOKED_KEY);
+    for hash in hashes {
+        cmd.arg(hash);
+    }
+    let flags: Vec<bool> = cmd.query_async(conn).await?;
+
+    Ok(hashes
+        .iter()
+        .zip(flags)
+        .filter(|(_, revoked)| *revoked)
+        .map(|(hash, _)| hash.clone())
+        .collect())
+}
+
+/// `max_total` and current `spent` for one level, for the 429 body. A level that has never
+/// been charged has no counter yet, which reads as zero rather than as an error.
+pub async fn read_level_state(
+    conn: &mut ConnectionManager,
+    cap_hash: &str,
+) -> RedisResult<(u128, u128)> {
+    let max_total: Option<String> = redis::cmd("HGET")
+        .arg(meta_key(cap_hash))
+        .arg("max_total")
+        .query_async(conn)
+        .await?;
+    let spent: Option<String> = redis::cmd("GET")
+        .arg(spent_key(cap_hash))
+        .query_async(conn)
+        .await?;
+
+    Ok((
+        max_total.and_then(|v| v.parse().ok()).unwrap_or(0),
+        spent.and_then(|v| v.parse().ok()).unwrap_or(0),
+    ))
+}
+
 /// Credits `amount` back to every given cap level after an upstream failure
 /// (Task 4.4, architecture.md §4.2 step 7: 2xx promotes, everything else
 /// voids and credits back). Deliberately does not touch `tg:nonce:{nonce}`:
@@ -591,6 +678,227 @@ mod claim {
             AMOUNT * PERMITTED,
             "total spend must never exceed max_total"
         );
+    }
+}
+
+/// Task 5.4: a charge draws down every capability in the chain, not just the leaf
+/// (architecture.md §5.2). These exercise the claim script through the same variadic level
+/// list the request path builds from a verified chain.
+#[cfg(test)]
+mod multilevel {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique(tag: &str) -> String {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the unix epoch")
+            .as_nanos();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{tag}-{nanos}-{n}")
+    }
+
+    async fn connect() -> ConnectionManager {
+        let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        redis::Client::open(url)
+            .expect("redis url should parse")
+            .get_connection_manager()
+            .await
+            .expect("redis should be reachable; start it with ./scripts/dev.sh")
+    }
+
+    async fn spent(conn: &mut ConnectionManager, cap_hash: &str) -> u128 {
+        let raw: Option<String> = redis::cmd("GET")
+            .arg(spent_key(cap_hash))
+            .query_async(conn)
+            .await
+            .expect("reading spend should succeed");
+        raw.map(|v| v.parse().expect("spend should be an integer"))
+            .unwrap_or(0)
+    }
+
+    const PAYLOAD_JSON: &str = r#"{"x402Version":1,"scheme":"exact","network":"eip155:84532"}"#;
+    const SIGNATURE_HEX: &str = "0x1b";
+
+    /// A supervisor -> lead -> worker chain, each level seeded with its own limits.
+    async fn chain(
+        conn: &mut ConnectionManager,
+        limits: [(u128, u128); 3],
+    ) -> Vec<String> {
+        let hashes: Vec<String> = (0..3).map(|i| unique(&format!("cap-level-{i}"))).collect();
+        for (hash, (max_total, max_per_request)) in hashes.iter().zip(limits) {
+            upsert_capability_meta(conn, hash, max_total, max_per_request, 1_800_000_000)
+                .await
+                .expect("seeding capability meta should succeed");
+        }
+        hashes
+    }
+
+    async fn claim(
+        conn: &mut ConnectionManager,
+        nonce: &str,
+        amount: u128,
+        hashes: &[String],
+    ) -> ClaimOutcome {
+        ClaimScript::new()
+            .submit(
+                conn,
+                ClaimRequest {
+                    nonce,
+                    amount,
+                    levels: hashes
+                        .iter()
+                        .map(|cap_hash| CapLevel {
+                            cap_hash: cap_hash.clone(),
+                        })
+                        .collect(),
+                    provider_slug: "mock-ok",
+                    payer: "0x00000000000000000000000000000000000000a1",
+                    ttl_secs: 360,
+                    payload_json: PAYLOAD_JSON,
+                    signature_hex: SIGNATURE_HEX,
+                },
+            )
+            .await
+            .expect("claim should not error")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live redis"]
+    async fn one_charge_increments_every_level() {
+        let mut conn = connect().await;
+        let hashes = chain(&mut conn, [(1_000_000, 100_000); 3]).await;
+
+        let outcome = claim(&mut conn, &unique("nonce"), 10_000, &hashes).await;
+        assert!(matches!(outcome, ClaimOutcome::Ok { .. }));
+
+        for (level, hash) in hashes.iter().enumerate() {
+            assert_eq!(
+                spent(&mut conn, hash).await,
+                10_000,
+                "level {level} must be charged, not just the leaf"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live redis"]
+    async fn a_void_credits_every_level_back() {
+        let mut conn = connect().await;
+        let hashes = chain(&mut conn, [(1_000_000, 100_000); 3]).await;
+
+        assert!(matches!(
+            claim(&mut conn, &unique("nonce"), 10_000, &hashes).await,
+            ClaimOutcome::Ok { .. }
+        ));
+        void(&mut conn, &hashes, 10_000)
+            .await
+            .expect("voiding should succeed");
+
+        for (level, hash) in hashes.iter().enumerate() {
+            assert_eq!(
+                spent(&mut conn, hash).await,
+                0,
+                "level {level} must be credited back; an upstream failure charges nobody"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live redis"]
+    async fn a_leaf_with_a_small_max_total_trips_first_and_names_level_two() {
+        let mut conn = connect().await;
+        // Ancestors are generous; the worker's own budget is what runs out.
+        let hashes = chain(
+            &mut conn,
+            [(1_000_000, 100_000), (1_000_000, 100_000), (15_000, 100_000)],
+        )
+        .await;
+
+        assert!(matches!(
+            claim(&mut conn, &unique("nonce"), 10_000, &hashes).await,
+            ClaimOutcome::Ok { .. }
+        ));
+
+        match claim(&mut conn, &unique("nonce"), 10_000, &hashes).await {
+            ClaimOutcome::Insufficient {
+                level,
+                cap_hash,
+                remaining,
+            } => {
+                assert_eq!(level, 2, "the leaf is level 2, root-first and 0-based");
+                assert_eq!(cap_hash, hashes[2]);
+                assert_eq!(remaining, 5_000);
+            }
+            other => panic!("expected the leaf to trip, got {other:?}"),
+        }
+
+        // The refused charge moved nothing anywhere.
+        assert_eq!(spent(&mut conn, &hashes[0]).await, 10_000);
+    }
+
+    /// The supervisor's pool emptying stops a worker that still has room of its own. This is
+    /// the behaviour the delegation tree exists to show.
+    #[tokio::test]
+    #[ignore = "requires a live redis"]
+    async fn a_root_with_a_small_max_total_trips_even_when_the_leaf_has_room() {
+        let mut conn = connect().await;
+        let hashes = chain(
+            &mut conn,
+            [(15_000, 100_000), (1_000_000, 100_000), (1_000_000, 100_000)],
+        )
+        .await;
+
+        assert!(matches!(
+            claim(&mut conn, &unique("nonce"), 10_000, &hashes).await,
+            ClaimOutcome::Ok { .. }
+        ));
+
+        match claim(&mut conn, &unique("nonce"), 10_000, &hashes).await {
+            ClaimOutcome::Insufficient {
+                level,
+                cap_hash,
+                remaining,
+            } => {
+                assert_eq!(level, 0, "the root is what said no");
+                assert_eq!(cap_hash, hashes[0]);
+                assert_eq!(remaining, 5_000);
+            }
+            other => panic!("expected the root to trip, got {other:?}"),
+        }
+
+        // The leaf had plenty left and is untouched by the refusal.
+        assert_eq!(spent(&mut conn, &hashes[2]).await, 10_000);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live redis"]
+    async fn a_per_request_cap_at_any_level_names_that_level() {
+        let mut conn = connect().await;
+        let hashes = chain(
+            &mut conn,
+            [(1_000_000, 100_000), (1_000_000, 5_000), (1_000_000, 100_000)],
+        )
+        .await;
+
+        match claim(&mut conn, &unique("nonce"), 10_000, &hashes).await {
+            ClaimOutcome::CapExceeded {
+                level,
+                cap_hash,
+                limit,
+            } => {
+                assert_eq!(level, 1);
+                assert_eq!(cap_hash, hashes[1]);
+                assert_eq!(limit, 5_000);
+            }
+            other => panic!("expected a per-request cap to trip, got {other:?}"),
+        }
+
+        for hash in &hashes {
+            assert_eq!(spent(&mut conn, hash).await, 0, "a refusal charges nothing");
+        }
     }
 }
 

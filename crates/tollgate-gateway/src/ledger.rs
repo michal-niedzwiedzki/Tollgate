@@ -320,14 +320,47 @@ async fn insert_reservation(
     let signature =
         Bytes::from_str(signature_hex).map_err(|e| format!("bad signature {signature_hex}: {e}"))?;
 
+    // Every level this charge drew against, root first, as written by the claim script in
+    // the same atomic execution as the decrement. Task 5.6 rebuilds each level's spend by
+    // summing `amount_wei` across this array, so a charge that omitted it would silently
+    // under-count its ancestors after a restart.
+    //
+    // Levels that are not capabilities (the payer-level case, keyed by `keccak(payer)`) are
+    // recorded here too. The column carries no foreign key precisely so that it can hold
+    // them, which keeps the boot rebuild to a single code path.
+    let chain_hashes: Vec<Vec<u8>> = fields
+        .get("cap_hashes")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .split(',')
+        .filter(|hash| !hash.is_empty())
+        .map(|hash| {
+            B256::from_str(hash)
+                .map(|h| h.as_slice().to_vec())
+                .map_err(|e| format!("bad cap hash {hash}: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+
+    // The leaf is "which agent spent this", which is the question the
+    // `(capability_hash, created_at DESC)` index exists to answer.
+    //
+    // Resolved through a subquery rather than bound directly: the column is a foreign key
+    // onto `capabilities`, and a payer-level hash has no row there. The subquery yields NULL
+    // in that case instead of a constraint violation — which would otherwise be a permanently
+    // unappliable entry, stalling this drain for every later reservation.
+    let leaf_hash: Option<Vec<u8>> = chain_hashes.last().cloned();
+
     // The nonce is the idempotency key end to end (architecture.md §9.4): a
     // reservation already landed from an earlier, unacked delivery is not an
     // error. This is also the other half of the outcome race: if the request
     // path's own `apply_outcome_update` already updated this row (the common
     // case, where the drain inserted first), this INSERT becomes the no-op.
     sqlx::query(
-        "INSERT INTO authorisations (nonce, payer, provider_slug, amount_wei, payload, signature, status)
-         VALUES ($1, $2, $3, $4::NUMERIC, $5::JSONB, $6, 'reserved')
+        "INSERT INTO authorisations
+           (nonce, payer, provider_slug, amount_wei, payload, signature, status,
+            capability_hash, chain_hashes)
+         VALUES ($1, $2, $3, $4::NUMERIC, $5::JSONB, $6, 'reserved',
+                 (SELECT hash FROM capabilities WHERE hash = $7), $8)
          ON CONFLICT (nonce) DO NOTHING",
     )
     .bind(nonce.as_slice())
@@ -336,6 +369,8 @@ async fn insert_reservation(
     .bind(amount)
     .bind(payload)
     .bind(signature.as_ref())
+    .bind(leaf_hash)
+    .bind(&chain_hashes)
     .execute(pg)
     .await
     .map_err(|e| format!("insert failed: {e}"))?;
