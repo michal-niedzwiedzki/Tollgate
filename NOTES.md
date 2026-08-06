@@ -141,6 +141,13 @@ It is a throwaway test harness (stdlib + `eth-account`), explicitly labelled as 
 also gives Task 5.1's `capability_vectors.json` the cross-language check that fixture exists for,
 a phase before the Python client needs it.
 
+**Amended while executing Task 5.1 (2026-08-06): the harness moves to Task 5.3.** Task 5.1's own
+Implementation section does not mention it and its Verification block is entirely Rust unit tests,
+which passed without it. Building it during 5.1 would have been scope this project's rules
+explicitly forbid. Task 5.3 is the first task whose verification actually needs a signed chain on
+the wire, so it lands there. `capability_vectors.json` exists as of 5.1 either way, so the harness
+has vectors to check itself against whenever it is written.
+
 ---
 
 ## Deferred
