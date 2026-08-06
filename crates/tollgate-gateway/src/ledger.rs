@@ -118,6 +118,87 @@ pub async fn apply_outcome_update(
     Ok(result.rows_affected())
 }
 
+/// Rebuilds every Redis capability counter from Postgres before the gateway serves
+/// anything (Task 5.6, architecture.md §9.3).
+///
+/// "Rebuild at boot, not lazily. A cold-start miss that lets an agent overspend is exactly
+/// the bug that surfaces later, once it's in use." A gateway that started with empty
+/// counters would treat every capability as unspent and let an agent spend its whole budget
+/// a second time, which is why this is awaited before the listener binds rather than being
+/// spawned alongside it.
+///
+/// Redis loss is survivable but not lossless: reservations that had been claimed and not yet
+/// drained into Postgres are gone with the stream. That window is seconds, and it is stated
+/// here rather than papered over — §9.3 is explicit that exactly-once across a Redis wipe is
+/// not on offer.
+pub async fn rebuild_counters(
+    redis: &mut ConnectionManager,
+    pg: &PgPool,
+) -> Result<(), tollgate_core::Error> {
+    // Steps 4 and 5 come from one pass over `capabilities`: a capability's limits and its
+    // revocation state are columns of the same row.
+    let capabilities = tollgate_core::db::list_capabilities(pg).await?;
+    let mut meta_rebuilt = 0usize;
+    let mut revoked_rebuilt = 0usize;
+
+    for stored in &capabilities {
+        let capability = &stored.capability;
+        let hash = capability.hash.to_string();
+
+        match (
+            u128::try_from(capability.max_total_wei),
+            u128::try_from(capability.max_per_req_wei),
+        ) {
+            (Ok(max_total), Ok(max_per_request)) => {
+                crate::policy::upsert_capability_meta(
+                    redis,
+                    &hash,
+                    max_total,
+                    max_per_request,
+                    capability.expiry,
+                )
+                .await?;
+                meta_rebuilt += 1;
+            }
+            // Unreachable for anything this gateway accepted, since the request path parses
+            // the same limits as u128 before seeding. Skipping is still the right response:
+            // an unparseable level must not become an unmetered one.
+            _ => {
+                tracing::warn!(%hash, "capability limits exceed u128; meta not rebuilt");
+            }
+        }
+
+        if stored.revoked_at.is_some() {
+            crate::policy::add_revoked(redis, &hash).await?;
+            revoked_rebuilt += 1;
+        }
+    }
+
+    // Step 3, last: the counters are what the claim script enforces against, so they are
+    // restored only once the limits they are checked against are already in place.
+    let spend = tollgate_core::db::spend_by_capability(pg).await?;
+    let mut total = alloy::primitives::U256::ZERO;
+    for (hash, amount) in &spend {
+        redis::cmd("SET")
+            .arg(crate::policy::spent_key(&hash.to_string()))
+            .arg(amount.to_string())
+            .exec_async(redis)
+            .await?;
+        total += *amount;
+    }
+
+    tracing::info!(
+        capabilities = capabilities.len(),
+        meta_rebuilt,
+        revoked_rebuilt,
+        levels_with_spend = spend.len(),
+        reconstructed_spend_wei = %total,
+        "rebuilt capability counters from postgres"
+    );
+
+    Ok(())
+}
+
 /// Creates the consumer group if needed, replays anything left pending from a
 /// previous run, then loops reading and applying new entries forever.
 ///

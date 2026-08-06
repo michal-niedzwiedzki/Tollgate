@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use redis::aio::ConnectionManager;
 use sqlx::postgres::PgPoolOptions;
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256, U256};
 use sqlx::PgPool;
 
 use crate::config::Config;
@@ -205,6 +205,47 @@ pub async fn capability_issuers(pool: &PgPool, hash: &[u8]) -> Result<Vec<Addres
     .await?;
 
     rows.iter().map(|(issuer,)| bytea_to_address(issuer)).collect()
+}
+
+/// Every capability, for rehydrating `tg:cap:{hash}:meta` and `tg:revoked` at boot
+/// (Task 5.6). Ordered by depth so a reader sees roots before their children.
+pub async fn list_capabilities(pool: &PgPool) -> Result<Vec<StoredCapability>> {
+    let rows: Vec<CapabilityRow> = sqlx::query_as(&format!(
+        "SELECT {CAPABILITY_COLUMNS} FROM capabilities ORDER BY depth, hash"
+    ))
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(StoredCapability::try_from).collect()
+}
+
+/// Reconstructed spend per capability level (Task 5.6, architecture.md §9.3: "rebuild
+/// capability counters from Postgres"). Redis is a projection; this is the truth it is
+/// rebuilt from.
+///
+/// Sums across `chain_hashes` rather than grouping by `capability_hash`, because every charge
+/// draws down every level of its chain and `capability_hash` only names the leaf. Grouping by
+/// the leaf would silently rebuild every ancestor as zero, which is exactly the cold-start
+/// overspend §9.3 warns about.
+///
+/// **`voided` is the only status excluded.** `failed` is deliberately counted: it is a charge
+/// whose upstream work was delivered to the caller and whose on-chain settlement later
+/// reverted, so the budget was genuinely consumed. Dropping it would hand the agent its money
+/// back on every restart — a cap-accounting leak, in the one area §9.3 calls "the whole
+/// product". Only `voided`, where the caller received nothing, is not a spend.
+pub async fn spend_by_capability(pool: &PgPool) -> Result<Vec<(B256, U256)>> {
+    let rows: Vec<(Vec<u8>, String)> = sqlx::query_as(
+        "SELECT h, SUM(amount_wei)::TEXT
+         FROM authorisations, unnest(chain_hashes) AS h
+         WHERE status IN ('reserved', 'queued', 'settled', 'failed')
+         GROUP BY h",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|(hash, total)| Ok((bytea_to_b256(&hash)?, numeric_to_u256(&total)?)))
+        .collect()
 }
 
 /// Stamps `revoked_at`. Idempotent: `WHERE revoked_at IS NULL` keeps the first revocation's

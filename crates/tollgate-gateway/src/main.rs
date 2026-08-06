@@ -46,6 +46,12 @@ async fn main() -> anyhow::Result<()> {
         ])?
         .install_recorder()?;
 
+    // architecture.md §9.3: rebuild at boot, not lazily, and before the listener binds — a
+    // cold-start miss that lets an agent overspend is exactly the bug that surfaces later.
+    // Awaited, not spawned: serving a request against empty counters is the failure this
+    // exists to prevent.
+    ledger::rebuild_counters(&mut redis, &pg).await?;
+
     tokio::spawn(ledger::run(cfg.redis_url.clone(), pg.clone()));
 
     let proxy_client = proxy::build_client();
