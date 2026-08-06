@@ -112,6 +112,370 @@ pub fn recover_issuer(
         .map_err(|e| CapabilityError::RecoveryFailed(e.to_string()))
 }
 
+/// Decoding the `X-Tollgate-Capability` header into an ordered chain. Task 5.2.
+///
+/// Decode only: nothing here recovers a signature, checks an expiry, or compares a link
+/// against its parent. That is the chain walk in Task 5.3. The one security-relevant thing
+/// this module does is the depth guard, which is a denial-of-service control and therefore
+/// has to run before any per-link work at all — see `decode_capability_chain`.
+pub mod decode {
+    use super::{allowlist_hash, Capability};
+    use alloy::primitives::{Address, Bytes, B256, U256};
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine;
+    use serde::Deserialize;
+    use serde_json::Value;
+
+    /// architecture.md §5.2 rule 1. Four links total, not four plus a funding root: under
+    /// Resolution A (§5.3) the parent funds the child wallet on-chain up front, so the chain
+    /// is pure policy and link 0's issuer *is* the funding wallet. There is no separate
+    /// root level to count.
+    pub const MAX_CHAIN_DEPTH: usize = 4;
+
+    #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+    pub enum ChainDecodeError {
+        #[error("invalid base64 in X-Tollgate-Capability header: {0}")]
+        InvalidBase64(String),
+        #[error("invalid JSON in capability chain: {0}")]
+        InvalidJson(String),
+        #[error("capability chain is empty")]
+        EmptyChain,
+        #[error("capability chain depth {depth} exceeds the maximum of {max}", max = MAX_CHAIN_DEPTH)]
+        DepthExceeded { depth: usize },
+        #[error("malformed link {index}: field {field}: {message}")]
+        MalformedLink {
+            index: usize,
+            field: String,
+            message: String,
+        },
+        #[error("link {index} declares an allowlist that does not hash to its allowlistHash")]
+        AllowlistMismatch { index: usize },
+        #[error("link {index} sets allowlistHash but presents no plaintext allowlist")]
+        AllowlistMissing { index: usize },
+    }
+
+    /// One decoded link. The plaintext `allowlist` rides along because `allowlistHash` is a
+    /// one-way hash: Task 5.3's subset check (§5.2 rule 4) needs the slugs themselves, and
+    /// the presenter is the only party that has them.
+    #[derive(Debug, Clone)]
+    pub struct ChainLink {
+        pub capability: Capability,
+        pub signature: Bytes,
+        /// Empty exactly when `allowlistHash` is `0x0`, meaning inherit from the parent.
+        pub allowlist: Vec<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct RawChainLink {
+        capability: RawCapability,
+        signature: String,
+        #[serde(default)]
+        allowlist: Vec<String>,
+    }
+
+    /// Numeric limits arrive as decimal strings because `maxTotal` and `maxPerRequest` are
+    /// `uint256` and do not survive a JSON number. The small unsigned fields are ordinary
+    /// JSON numbers. Unknown fields are ignored, so the Task 5.1 vector file's extra keys
+    /// (`label`, `structHash`, …) can be presented verbatim as a chain.
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RawCapability {
+        issuer: String,
+        subject: String,
+        parent: String,
+        max_total: String,
+        max_per_request: String,
+        allowlist_hash: String,
+        not_before: u64,
+        expiry: u64,
+        max_depth: u32,
+        salt: String,
+    }
+
+    /// Base64-decodes and JSON-parses the `X-Tollgate-Capability` header into an ordered
+    /// chain, root first.
+    ///
+    /// **The depth guard runs before any per-link parsing.** architecture.md §5.2 rule 1
+    /// calls for rejecting deeper chains "before doing any signature work", and the cheapest
+    /// way to guarantee that is to not look inside the links at all: the payload is parsed
+    /// only as far as a JSON array, counted, and rejected. An attacker cannot make this
+    /// gateway do per-link work by sending a hundred links.
+    pub fn decode_capability_chain(header: &str) -> Result<Vec<ChainLink>, ChainDecodeError> {
+        let decoded = BASE64
+            .decode(header)
+            .map_err(|e| ChainDecodeError::InvalidBase64(e.to_string()))?;
+
+        let raw: Vec<Value> = serde_json::from_slice(&decoded)
+            .map_err(|e| ChainDecodeError::InvalidJson(e.to_string()))?;
+
+        if raw.is_empty() {
+            return Err(ChainDecodeError::EmptyChain);
+        }
+        if raw.len() > MAX_CHAIN_DEPTH {
+            return Err(ChainDecodeError::DepthExceeded { depth: raw.len() });
+        }
+
+        raw.into_iter()
+            .enumerate()
+            .map(|(index, value)| parse_link(index, value))
+            .collect()
+    }
+
+    fn parse_link(index: usize, value: Value) -> Result<ChainLink, ChainDecodeError> {
+        let raw: RawChainLink =
+            serde_json::from_value(value).map_err(|e| ChainDecodeError::MalformedLink {
+                index,
+                field: "link".to_string(),
+                message: e.to_string(),
+            })?;
+
+        let field = |name: &str, message: String| ChainDecodeError::MalformedLink {
+            index,
+            field: name.to_string(),
+            message,
+        };
+
+        let parse_address = |name: &str, raw: &str| {
+            raw.parse::<Address>()
+                .map_err(|e| field(name, e.to_string()))
+        };
+        let parse_b256 = |name: &str, raw: &str| {
+            raw.parse::<B256>().map_err(|e| field(name, e.to_string()))
+        };
+        let parse_u256 = |name: &str, raw: &str| {
+            U256::from_str_radix(raw, 10).map_err(|e| field(name, e.to_string()))
+        };
+
+        let capability = Capability {
+            issuer: parse_address("issuer", &raw.capability.issuer)?,
+            subject: parse_address("subject", &raw.capability.subject)?,
+            parent: parse_b256("parent", &raw.capability.parent)?,
+            maxTotal: parse_u256("maxTotal", &raw.capability.max_total)?,
+            maxPerRequest: parse_u256("maxPerRequest", &raw.capability.max_per_request)?,
+            allowlistHash: parse_b256("allowlistHash", &raw.capability.allowlist_hash)?,
+            notBefore: raw.capability.not_before,
+            expiry: raw.capability.expiry,
+            maxDepth: raw.capability.max_depth,
+            salt: parse_b256("salt", &raw.capability.salt)?,
+        };
+
+        let signature: Bytes = raw
+            .signature
+            .parse()
+            .map_err(|e: alloy::hex::FromHexError| field("signature", e.to_string()))?;
+
+        // The declared allowlist must actually be the one that was signed. Without this the
+        // plaintext list would be attacker-controlled free text and the hash inside the
+        // signed capability would constrain nothing.
+        if capability.allowlistHash == B256::ZERO {
+            // 0x0 means inherit from the parent, so there is nothing to present. A link
+            // that ships slugs anyway is contradicting its own signed field.
+            if !raw.allowlist.is_empty() {
+                return Err(ChainDecodeError::AllowlistMismatch { index });
+            }
+        } else {
+            if raw.allowlist.is_empty() {
+                return Err(ChainDecodeError::AllowlistMissing { index });
+            }
+            if allowlist_hash(&raw.allowlist) != capability.allowlistHash {
+                return Err(ChainDecodeError::AllowlistMismatch { index });
+            }
+        }
+
+        Ok(ChainLink {
+            capability,
+            signature,
+            allowlist: raw.allowlist,
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use serde_json::json;
+
+        const VECTORS: &str = include_str!("../tests/fixtures/capability_vectors.json");
+
+        /// The Task 5.1 vector file's links, used verbatim as wire links. That the fixture
+        /// needs no reshaping to be presented as a header is the point: the shape a
+        /// supervisor signs is the shape a worker sends.
+        fn fixture_links() -> Vec<Value> {
+            let vectors: Value = serde_json::from_str(VECTORS).expect("fixture should parse");
+            vectors["capabilities"]
+                .as_array()
+                .expect("fixture should hold a capabilities array")
+                .clone()
+        }
+
+        fn encode(links: &Value) -> String {
+            BASE64.encode(serde_json::to_vec(links).expect("links should serialise"))
+        }
+
+        #[test]
+        fn a_valid_three_link_chain_decodes_root_first() {
+            let links = fixture_links();
+            let chain = decode_capability_chain(&encode(&json!(links)))
+                .expect("the fixture chain should decode");
+
+            assert_eq!(chain.len(), 3);
+
+            // Root first, and provably so: each link's parent is the previous link's struct
+            // hash, which only holds in this order.
+            assert_eq!(chain[0].capability.parent, B256::ZERO, "link 0 is the root");
+            assert_eq!(
+                chain[1].capability.parent,
+                super::super::struct_hash(&chain[0].capability),
+                "link 1 must point at link 0"
+            );
+            assert_eq!(
+                chain[2].capability.parent,
+                super::super::struct_hash(&chain[1].capability),
+                "link 2 must point at link 1"
+            );
+
+            // Delegation runs issuer -> subject -> issuer down the chain.
+            assert_eq!(chain[1].capability.issuer, chain[0].capability.subject);
+            assert_eq!(chain[2].capability.issuer, chain[1].capability.subject);
+
+            assert_eq!(chain[0].allowlist, vec!["geocode", "weather"]);
+            assert_eq!(chain[2].allowlist, vec!["geocode"]);
+            assert_eq!(chain[0].signature.len(), 65, "a 65-byte ecdsa signature");
+        }
+
+        #[test]
+        fn a_five_link_chain_is_rejected_for_depth() {
+            let mut links = fixture_links();
+            let extra = links.clone();
+            links.extend(extra.into_iter().take(2));
+            assert_eq!(links.len(), 5);
+
+            let err = decode_capability_chain(&encode(&json!(links)))
+                .expect_err("five links exceeds the maximum of four");
+            assert_eq!(err, ChainDecodeError::DepthExceeded { depth: 5 });
+        }
+
+        /// architecture.md §5.2 rule 1 requires the depth guard to run before *any*
+        /// signature work. Rather than counting recoveries — a counter would read zero
+        /// trivially, since this module never recovers at all — this asserts something
+        /// stronger and non-circular: a five-link chain whose links are not even objects
+        /// still fails on depth. If a single link were parsed, let alone recovered, the
+        /// error would be `MalformedLink` instead.
+        #[test]
+        fn depth_is_rejected_before_any_per_link_work() {
+            let garbage = json!([1, "two", null, {"nonsense": true}, []]);
+            let err = decode_capability_chain(&encode(&garbage))
+                .expect_err("five links exceeds the maximum of four");
+            assert_eq!(
+                err,
+                ChainDecodeError::DepthExceeded { depth: 5 },
+                "depth must be decided from the array length alone"
+            );
+
+            // The control: the same garbage within the depth limit *does* reach per-link
+            // parsing, which proves the test above is not passing for some unrelated reason.
+            let short = json!([1, "two"]);
+            assert!(matches!(
+                decode_capability_chain(&encode(&short)).unwrap_err(),
+                ChainDecodeError::MalformedLink { index: 0, .. }
+            ));
+        }
+
+        #[test]
+        fn an_allowlist_that_does_not_hash_to_its_declared_hash_is_rejected() {
+            let mut links = fixture_links();
+            links[1]["allowlist"] = json!(["geocode", "weather", "smuggled"]);
+
+            let err = decode_capability_chain(&encode(&json!(links)))
+                .expect_err("a tampered allowlist must not decode");
+            assert_eq!(err, ChainDecodeError::AllowlistMismatch { index: 1 });
+        }
+
+        #[test]
+        fn a_missing_allowlist_is_rejected_when_the_hash_is_set() {
+            let mut links = fixture_links();
+            links[0]["allowlist"] = json!([]);
+
+            let err = decode_capability_chain(&encode(&json!(links)))
+                .expect_err("allowlistHash != 0 requires the plaintext list");
+            assert_eq!(err, ChainDecodeError::AllowlistMissing { index: 0 });
+        }
+
+        /// `0x0` means inherit, so presenting slugs alongside it contradicts the signed
+        /// field and must not be silently ignored.
+        #[test]
+        fn an_inheriting_link_may_not_present_an_allowlist() {
+            let mut links = fixture_links();
+            links[2]["capability"]["allowlistHash"] = json!(B256::ZERO.to_string());
+
+            let err = decode_capability_chain(&encode(&json!(links)))
+                .expect_err("0x0 plus slugs is contradictory");
+            assert_eq!(err, ChainDecodeError::AllowlistMismatch { index: 2 });
+
+            // With the slugs removed it is a well-formed inheriting link.
+            links[2]["allowlist"] = json!([]);
+            let chain = decode_capability_chain(&encode(&json!(links)))
+                .expect("inheriting with no slugs is valid");
+            assert!(chain[2].allowlist.is_empty());
+            assert_eq!(chain[2].capability.allowlistHash, B256::ZERO);
+        }
+
+        #[test]
+        fn an_empty_chain_is_rejected() {
+            let err = decode_capability_chain(&encode(&json!([])))
+                .expect_err("an empty chain grants nothing and must not decode");
+            assert_eq!(err, ChainDecodeError::EmptyChain);
+        }
+
+        #[test]
+        fn bad_base64_and_bad_json_are_distinct_errors() {
+            assert!(matches!(
+                decode_capability_chain("not!valid!base64").unwrap_err(),
+                ChainDecodeError::InvalidBase64(_)
+            ));
+            assert!(matches!(
+                decode_capability_chain(&BASE64.encode("{not json")).unwrap_err(),
+                ChainDecodeError::InvalidJson(_)
+            ));
+            // A JSON object rather than an array is a shape error, not a link error.
+            assert!(matches!(
+                decode_capability_chain(&BASE64.encode("{}")).unwrap_err(),
+                ChainDecodeError::InvalidJson(_)
+            ));
+        }
+
+        #[test]
+        fn each_malformed_field_names_itself() {
+            for (field, mutate) in [
+                ("issuer", json!("0xnothex")),
+                ("salt", json!("0x01")),
+                ("maxTotal", json!("not a number")),
+            ] {
+                let mut links = fixture_links();
+                links[0]["capability"][field] = mutate;
+
+                let err = decode_capability_chain(&encode(&json!(links)))
+                    .expect_err("a malformed field must not decode");
+                match err {
+                    ChainDecodeError::MalformedLink { index, field: got, .. } => {
+                        assert_eq!(index, 0);
+                        assert_eq!(got, field, "the error must name the offending field");
+                    }
+                    other => panic!("expected MalformedLink for {field}, got {other:?}"),
+                }
+            }
+
+            // A malformed signature is a link error too, not a recovery failure: this
+            // module does no crypto.
+            let mut links = fixture_links();
+            links[0]["signature"] = json!("0xzz");
+            assert!(matches!(
+                decode_capability_chain(&encode(&json!(links))).unwrap_err(),
+                ChainDecodeError::MalformedLink { index: 0, .. }
+            ));
+        }
+    }
+}
+
 #[cfg(test)]
 mod hash {
     use super::*;
