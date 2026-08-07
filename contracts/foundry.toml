@@ -1,0 +1,14 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+
+# Pinned, not defaulted. Task 6.2 commits a gas snapshot and the README quotes a per-charge
+# cost derived from it, so the optimiser settings and the compiler version are both part of
+# that number. Changing either without regenerating the snapshot invalidates the claim.
+optimizer = true
+optimizer_runs = 200
+solc = "0.8.35"
+
+[rpc_endpoints]
+base_sepolia = "https://sepolia.base.org"
