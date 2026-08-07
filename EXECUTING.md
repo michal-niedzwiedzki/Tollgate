@@ -115,7 +115,7 @@ against and how each verification catches one. Then implement.
 ## 3. Phase Gate prompt
 
 ```
-Run the Phase N Gate from plan.md.
+Run the Phase 5 Gate from plan.md.
 
 Work through the checklist one item at a time. For each: run the actual command or test,
 paste the output, and mark it pass or fail. Do not mark an item passed on the grounds that

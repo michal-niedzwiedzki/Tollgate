@@ -231,27 +231,52 @@ pub async fn run(redis_url: String, pg: PgPool) {
         return;
     }
 
-    // A previous run may have XREADGROUP'd entries into this consumer's PEL
-    // without acking them (crash, or a failed insert). Replay those before
-    // taking anything new, using "0" to read this consumer's own pending list
-    // from the start rather than ">" for undelivered entries.
-    loop {
-        match read_group(&mut redis, "0", None).await {
-            Ok(entries) if entries.is_empty() => break,
-            Ok(entries) => apply_batch(&mut redis, &pg, entries).await,
-            Err(err) => {
-                tracing::error!(error = %err, "failed to read pending reservations at startup");
-                break;
-            }
-        }
-    }
+    replay_pending(&mut redis, &pg, RESERVATIONS_KEY).await;
 
     loop {
-        match read_group(&mut redis, ">", Some(BLOCK_MS)).await {
-            Ok(entries) => apply_batch(&mut redis, &pg, entries).await,
+        match read_group(&mut redis, RESERVATIONS_KEY, ">", Some(BLOCK_MS)).await {
+            Ok(entries) => apply_batch(&mut redis, &pg, RESERVATIONS_KEY, entries).await,
             Err(err) => {
                 tracing::error!(error = %err, "XREADGROUP failed; retrying");
                 tokio::time::sleep(Duration::from_millis(1000)).await;
+            }
+        }
+    }
+}
+
+/// Replays this consumer's pending list once, at startup.
+///
+/// A previous run may have `XREADGROUP`'d entries into the PEL without acking them — a crash,
+/// or an insert that failed. Those are redelivered here before any new entry is taken.
+///
+/// **The cursor is what makes this terminate.** `apply_batch` deliberately leaves an entry
+/// un-acked when it cannot be applied (Task 3.4: "never let one bad entry stall the drain"),
+/// which is right for the steady-state `>` loop because that always advances. Re-reading from
+/// `"0"` every iteration does not advance: an entry that can *never* apply — a `provider_slug`
+/// whose row was deleted, a payload a later migration cannot parse, a row hitting a new CHECK
+/// constraint — is redelivered forever, this loop never ends, and the drain never reaches the
+/// `>` loop at all. No reservation is written to Postgres for the remaining life of the
+/// process, while the request path happily keeps returning 200.
+///
+/// Paging forward from the last id read means a permanently-unappliable entry is passed over
+/// once per boot instead. It stays in the PEL for an operator to inspect or `XACK`, and every
+/// entry behind it still lands.
+async fn replay_pending(redis: &mut ConnectionManager, pg: &PgPool, stream: &str) {
+    let mut cursor = "0".to_string();
+    loop {
+        match read_group(redis, stream, &cursor, None).await {
+            Ok(entries) if entries.is_empty() => break,
+            Ok(entries) => {
+                // Advance past this page before applying it, so the next read cannot return
+                // the same entries regardless of which of them applied.
+                if let Some((last_id, _)) = entries.last() {
+                    cursor = last_id.clone();
+                }
+                apply_batch(redis, pg, stream, entries).await;
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "failed to read pending reservations at startup");
+                break;
             }
         }
     }
@@ -277,6 +302,7 @@ async fn ensure_group(redis: &mut ConnectionManager) -> redis::RedisResult<()> {
 
 async fn read_group(
     redis: &mut ConnectionManager,
+    stream: &str,
     id: &str,
     block_ms: Option<usize>,
 ) -> redis::RedisResult<Vec<(String, HashMap<String, String>)>> {
@@ -288,7 +314,7 @@ async fn read_group(
     cmd.arg("COUNT")
         .arg(BATCH_SIZE)
         .arg("STREAMS")
-        .arg(RESERVATIONS_KEY)
+        .arg(stream)
         .arg(id);
 
     let value: Value = cmd.query_async(redis).await?;
@@ -348,12 +374,13 @@ fn parse_stream_reply(value: Value) -> Vec<(String, HashMap<String, String>)> {
 async fn apply_batch(
     redis: &mut ConnectionManager,
     pg: &PgPool,
+    stream: &str,
     entries: Vec<(String, HashMap<String, String>)>,
 ) {
     for (id, fields) in entries {
         match insert_reservation(redis, pg, &fields).await {
             Ok(()) => {
-                if let Err(err) = ack(redis, &id).await {
+                if let Err(err) = ack(redis, stream, &id).await {
                     tracing::error!(error = %err, entry_id = %id, "failed to XACK a committed reservation");
                 }
             }
@@ -368,9 +395,9 @@ async fn apply_batch(
     }
 }
 
-async fn ack(redis: &mut ConnectionManager, id: &str) -> redis::RedisResult<()> {
+async fn ack(redis: &mut ConnectionManager, stream: &str, id: &str) -> redis::RedisResult<()> {
     redis::cmd("XACK")
-        .arg(RESERVATIONS_KEY)
+        .arg(stream)
         .arg(CONSUMER_GROUP)
         .arg(id)
         .query_async(redis)
@@ -699,6 +726,124 @@ mod outcome_race {
             observed,
             Some(("queued".to_string(), Some(200))),
             "the first outcome stands"
+        );
+    }
+}
+
+/// The startup replay must terminate even when an entry in the pending list can never be
+/// applied. Before the cursor was introduced, `replay_pending` re-read from `"0"` on every
+/// iteration and a single poison entry wedged it forever, silently stopping every ledger
+/// write for the life of the process.
+#[cfg(test)]
+mod replay {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    async fn pg_pool() -> PgPool {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/tollgate".to_string());
+        PgPool::connect(&url)
+            .await
+            .expect("postgres should be reachable; start it with ./scripts/dev.sh")
+    }
+
+    /// A stream of this consumer group's own, so the shared `tg:reservations` stream and the
+    /// other integration tests are untouched.
+    fn isolated_stream() -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the unix epoch")
+            .as_nanos();
+        format!("tg:test:replay:{nanos}")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live redis and postgres"]
+    async fn a_poison_entry_does_not_wedge_the_startup_replay() {
+        let url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let client = redis::Client::open(url).expect("redis url should parse");
+        let mut redis = client
+            .get_connection_manager()
+            .await
+            .expect("redis should be reachable; start it with ./scripts/dev.sh");
+        let pg = pg_pool().await;
+
+        let stream = isolated_stream();
+
+        // Two entries that can never be applied: `nonce` is not hex, so `insert_reservation`
+        // fails to parse it and leaves them un-acked, exactly like the real poison cases.
+        for i in 0..2 {
+            let _: String = redis::cmd("XADD")
+                .arg(&stream)
+                .arg("*")
+                .arg("nonce")
+                .arg(format!("not-hex-{i}"))
+                .arg("payer")
+                .arg("0x00000000000000000000000000000000000000a1")
+                .arg("provider")
+                .arg("mock-ok")
+                .arg("amount")
+                .arg("1000")
+                .arg("payload")
+                .arg("{}")
+                .arg("signature")
+                .arg("0x1b")
+                .arg("cap_hashes")
+                .arg("")
+                .query_async(&mut redis)
+                .await
+                .expect("XADD should succeed");
+        }
+
+        let _: () = redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg(&stream)
+            .arg(CONSUMER_GROUP)
+            .arg("0")
+            .arg("MKSTREAM")
+            .query_async(&mut redis)
+            .await
+            .expect("XGROUP CREATE should succeed");
+
+        // Deliver both into this consumer's PEL, un-acked.
+        let _: redis::Value = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg(CONSUMER_GROUP)
+            .arg(CONSUMER_NAME)
+            .arg("COUNT")
+            .arg(10)
+            .arg("STREAMS")
+            .arg(&stream)
+            .arg(">")
+            .query_async(&mut redis)
+            .await
+            .expect("XREADGROUP should succeed");
+
+        let pending: i64 = redis::cmd("XLEN")
+            .arg(&stream)
+            .query_async(&mut redis)
+            .await
+            .unwrap();
+        assert_eq!(pending, 2, "both poison entries are in the stream");
+
+        // The assertion is simply that this returns. Under the old re-read-from-zero loop it
+        // never did, so the timeout is the test.
+        let replayed = tokio::time::timeout(
+            Duration::from_secs(10),
+            replay_pending(&mut redis, &pg, &stream),
+        )
+        .await;
+
+        let _: () = redis::cmd("DEL")
+            .arg(&stream)
+            .query_async(&mut redis)
+            .await
+            .unwrap_or(());
+
+        assert!(
+            replayed.is_ok(),
+            "the startup replay must terminate even with an unappliable entry in the PEL"
         );
     }
 }

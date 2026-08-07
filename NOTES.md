@@ -150,14 +150,16 @@ has vectors to check itself against whenever it is written.
 
 ---
 
-## Deferred
+## Fixed
 
-Things noticed during execution that are out of scope for the task that surfaced them.
-Not committed to the diff; recorded here per `CLAUDE.md`'s scope rule.
+Items that were deferred and have since been resolved. Kept rather than deleted: the reasoning
+is the reason the regression test exists, and a future reader who sees the cursor in
+`replay_pending` deserves to know what it is defending against.
 
-### The ledger drain's startup replay wedges on a permanently-unprocessable entry
+### The ledger drain's startup replay wedged on a permanently-unprocessable entry
 
 **Found:** 2026-08-06, while re-verifying Phases 0–4 before starting Phase 5.
+**Fixed:** 2026-08-06, after the Phase 5 Gate, as a standalone change.
 
 `ledger::run` (`crates/tollgate-gateway/src/ledger.rs`) replays this consumer's pending list
 before reading new entries:
@@ -203,21 +205,87 @@ should be made deliberately rather than folded into an unrelated commit.
 a poison entry lands leaves the gateway silently not persisting charges. Clearing the current
 backlog with `XACK`, or a fresh `FLUSHALL`, restores normal operation until the next one.
 
-**Resolved: scheduled for Task 5.6** (decided 2026-08-06, alongside the Phase 5 decisions above).
-Task 5.6 owns boot-time recovery and its own correctness now depends on the drain having actually
-persisted the charges it rebuilds from, so the fix belongs there rather than in a standalone
-commit. `plan.md` Task 5.6 step 6 already names this startup path as part of its sequence.
+**How it was fixed.** The startup replay moved out of `ledger::run` into `replay_pending`, which
+tracks the last entry id it read and pages forward with `XREADGROUP ... <last_id>` instead of
+re-reading from `0`. An entry that can never be applied is now passed over once per boot rather
+than redelivered forever; it stays in the PEL for an operator to inspect or `XACK`, and every
+entry behind it still lands. The steady-state `>` loop is unchanged, and Task 3.4's "log and
+continue, never let one bad entry stall the drain" rule is preserved — it is finally true of the
+startup path too, which is the half where it was not.
 
-The fix is the first of the two options above: track the last-read entry id and page forward with
-`XREADGROUP ... <last_id>` instead of re-reading from `0` every iteration, so an entry that can
-never be applied is passed over once per boot instead of redelivered forever. The steady-state
-`>` loop is unchanged, and Task 3.4's "log and continue, never let one bad entry stall the drain"
-rule is preserved — it is finally true of the startup path too, which is the half where it was
-not.
+`read_group`, `ack`, `apply_batch` and `replay_pending` take the stream key as a parameter
+instead of hardcoding `RESERVATIONS_KEY`. That exists so the regression test can drive the replay
+against a throwaway stream without touching `tg:reservations` or racing the other integration
+tests.
+
+**Not scheduled into a plan task.** It was briefly earmarked for Task 5.6, then kept out: 5.6's
+Implementation section describes the startup path as "already implemented" and asks for no change
+there, and this note itself argued the fix should be made deliberately rather than folded into an
+unrelated commit. It was done on its own afterwards instead.
+
+**How the fix is verified.** `ledger::replay::a_poison_entry_does_not_wedge_the_startup_replay`
+puts two unappliable entries in a consumer's PEL and asserts the replay returns. It was run
+against the old re-read-from-zero loop first, where it failed on the 10s timeout, and against the
+fix, where it passes in 0.06s — so the test is known to reproduce the bug rather than merely
+passing.
+
+Live: with a poison entry in `tg:reservations` and the gateway restarted, the log showed **one**
+error line instead of the unbounded flood, `authorisations` went from 2 rows to 4 as later paid
+requests landed, and the poison entry remained pending — one, not retried.
 
 Separately, decision D6 removes the one *new* poison source Phase 5 would otherwise have
-introduced (a `capability_hash` FK violation), so the fix is not being asked to cover for
-Phase 5's own additions.
+introduced (a `capability_hash` FK violation), so the fix is not covering for Phase 5's additions.
+
+---
+
+## Deferred
+
+Things noticed during execution that are out of scope for the task that surfaced them.
+Not committed to the diff; recorded here per `CLAUDE.md`'s scope rule.
+
+### `policy::multilevel` makes the integration suite flaky (~1 run in 3)
+
+**Found:** 2026-08-06, running the full `--ignored` suite after the drain-wedge fix.
+
+`policy::claim::a_successful_claim_sets_the_nonce_ttl_charges_and_appends_to_the_stream`
+asserts that exactly one entry was appended to `tg:reservations`:
+
+```rust
+assert_eq!(stream_len(&mut conn).await, before + 1, "one reservation appended");
+```
+
+Every test in `mod claim` takes a module-level `STREAM_LOCK` so those length assertions cannot
+overlap each other. **`mod multilevel` — added in Task 5.4 — does not take that lock**, and its
+five tests all invoke `ClaimScript::submit`, which `XADD`s to the same shared stream. When the
+timing lines up, the assertion sees the stream grow by two:
+
+```
+assertion `left == right` failed: one reservation appended
+  left: 362
+ right: 361
+```
+
+**Measured:** full gateway `--ignored` suite, 3 failures in 6 runs. With `--skip multilevel`,
+0 failures in 6 runs. Reproduced identically against `HEAD`'s `ledger.rs`, so it predates the
+drain-wedge fix and is not caused by it — it has been latent since Task 5.4 and earlier "tests
+pass" reports were luck.
+
+**Product impact: none.** The claim script is correct and the concurrency test that matters
+(`one_hundred_concurrent_claims_stop_exactly_at_max_total`) is unaffected, because it asserts on
+spend counters rather than stream length. This is purely two test modules sharing one Redis
+stream without sharing its lock.
+
+**Why deferred, not fixed:** it surfaced during an unrelated change and folding a test-isolation
+fix into the drain-wedge commit is exactly what this file argued against for the wedge itself.
+The fix is small but has a design choice in it: hoist `STREAM_LOCK` out of `mod claim` into the
+`policy` test scope so both modules share one lock, or give `mod multilevel` its own stream key
+so it never touches `tg:reservations` at all. The second is better — tests that do not need the
+shared stream should not contend for it — but it means threading a stream key through
+`ClaimArgs`, which is production surface changed for a test's benefit.
+
+**Effect if left as is:** `cargo test --workspace -- --ignored` fails intermittently on an
+assertion unrelated to whatever is being changed, which will waste time and erode trust in the
+suite.
 
 ### Request path is not tolerant of a Postgres outage
 
