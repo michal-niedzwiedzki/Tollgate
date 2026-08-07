@@ -558,6 +558,58 @@ Notable tests, if you want to read the ones that carry the weight:
 
 ---
 
+## Local chain: anvil fork and deploy
+
+Settlement needs a chain. For everything short of Task 6.6's live run, that chain is a local
+anvil fork of Base Sepolia, which gives real USDC semantics — EIP-712 verification, the
+`authorizationState` replay guard, real balance accounting — with no faucet and no waiting.
+
+```bash
+./scripts/anvil.sh &        # forks Base Sepolia, funds a test EOA with ETH and USDC
+```
+
+It prints the RPC, the funded test EOA and its key. anvil's own output goes to
+`/tmp/tollgate-anvil.log`. `kill %1` stops it. Overridable by environment:
+
+| Variable | Default | |
+|---|---|---|
+| `BASE_SEPOLIA_RPC` | `https://sepolia.base.org` | what to fork; the public endpoint needs no key |
+| `ANVIL_PORT` | `8545` | |
+| `USDC_ADDRESS` | `0x036CbD…dCF7e` | native USDC on Base Sepolia |
+| `USDC_FUND_UNITS` | `1000000000` | 1,000 USDC at 6 decimals |
+| `TEST_EOA_KEY` | committed test key | throwaway, fork-only, holds nothing real |
+
+Then deploy `BatchSettler` into it and point `.env` at the result:
+
+```bash
+cd contracts
+export ANVIL_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80  # anvil account 0
+forge script script/Deploy.s.sol --rpc-url http://localhost:8545 --broadcast --private-key $ANVIL_KEY
+# BatchSettler deployed at: 0x…
+
+cast code <address> --rpc-url http://localhost:8545     # non-empty confirms it
+```
+
+Put that address in `.env` as `BATCH_SETTLER_ADDRESS`, and set `RPC_URL=http://localhost:8545`
+so the settler talks to the fork rather than a public endpoint.
+
+**Two things about this fork that will bite if you do not know them.**
+
+The fork must run with `--chain-id 84532`, which `anvil.sh` passes. anvil defaults to 31337, and
+every EIP-3009 payment and every capability in this project commits to chain 84532 inside its
+EIP-712 domain — on a 31337 fork all of them fail to verify, for a reason the error messages do
+not make obvious.
+
+The funded test EOA is **not** one of anvil's ten default accounts. All ten have EIP-7702
+delegation code deployed at their addresses on real Base Sepolia, and USDC's `SignatureChecker`
+routes any `from` that has code to ERC-1271 rather than `ecrecover`. An anvil default therefore
+cannot make a working EIP-3009 payment against forked USDC — it fails with
+`FiatTokenV2: invalid signature` however correctly the payload is signed. `anvil.sh` refuses to
+start if its test EOA ever has code. The same constraint applies to the real payer wallet in a
+live run: it must be a plain EOA.
+
+---
+
 ## Settlement cost
 
 `prd.md` §8 claims settlement costs under $0.001 per request after batching, "verified with `forge`
