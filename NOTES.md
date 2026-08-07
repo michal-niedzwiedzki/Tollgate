@@ -264,16 +264,10 @@ requests landed, and the poison entry remained pending — one, not retried.
 Separately, decision D6 removes the one *new* poison source Phase 5 would otherwise have
 introduced (a `capability_hash` FK violation), so the fix is not covering for Phase 5's additions.
 
----
-
-## Deferred
-
-Things noticed during execution that are out of scope for the task that surfaced them.
-Not committed to the diff; recorded here per `CLAUDE.md`'s scope rule.
-
-### `policy::multilevel` makes the integration suite flaky (~1 run in 3)
+### `policy::multilevel` made the integration suite flaky (~1 run in 3)
 
 **Found:** 2026-08-06, running the full `--ignored` suite after the drain-wedge fix.
+**Fixed:** 2026-08-06, as a standalone change, before starting Phase 6.
 
 `policy::claim::a_successful_claim_sets_the_nonce_ttl_charges_and_appends_to_the_stream`
 asserts that exactly one entry was appended to `tg:reservations`:
@@ -303,17 +297,37 @@ pass" reports were luck.
 spend counters rather than stream length. This is purely two test modules sharing one Redis
 stream without sharing its lock.
 
-**Why deferred, not fixed:** it surfaced during an unrelated change and folding a test-isolation
-fix into the drain-wedge commit is exactly what this file argued against for the wedge itself.
-The fix is small but has a design choice in it: hoist `STREAM_LOCK` out of `mod claim` into the
-`policy` test scope so both modules share one lock, or give `mod multilevel` its own stream key
-so it never touches `tg:reservations` at all. The second is better — tests that do not need the
-shared stream should not contend for it — but it means threading a stream key through
-`ClaimArgs`, which is production surface changed for a test's benefit.
+**How it was fixed — the shared state was removed, not locked harder.**
 
-**Effect if left as is:** `cargo test --workspace -- --ignored` fails intermittently on an
-assertion unrelated to whatever is being changed, which will waste time and erode trust in the
-suite.
+Two options were on the table: hoist `STREAM_LOCK` so both modules share one lock, or stop the
+tests touching `tg:reservations` at all. The second was chosen. A lock leaves the trap in place —
+the next test module to claim against the shared stream reintroduces exactly this bug, and
+nothing in the code would say so. Removing the shared stream removes the trap.
+
+The cost turned out to be far smaller than this note first estimated. The stream is **already**
+`KEYS[n+2]` of `claim.lua`; only the Rust caller hardcoded it. So `ClaimScript` gained a `stream`
+field and a `with_stream` constructor, `new()` is `with_stream(RESERVATIONS_KEY)`, and the
+invocation reads `self.stream`. No behaviour changes, no threading through `ClaimArgs`, and the
+gateway's own call site (`ClaimScript::new()` in `main.rs`) is untouched.
+
+Both test modules now build a throwaway stream per test and `DEL` it at the end.
+**`STREAM_LOCK` is deleted** — with no other writer, `mod claim`'s assertion tightened from
+`before + 1` to an exact `1`, which is a stronger claim than the locked version ever made.
+
+**Verified:** full `--ignored` suite **0 failures in 15 runs** (was 3 in 6). Root cause confirmed
+gone rather than merely quiet: across a full suite run `XLEN tg:reservations` is unchanged
+(1728 → 1728), so the tests no longer write to the shared stream at all, and `KEYS tg:test:*`
+is 0 before and after, so nothing leaks. The production path was smoke-tested separately because
+this touched `policy.rs`: a paid request still returns 200, still `XADD`s to the real
+`tg:reservations` (1728 → 1729), and the drain still persists it (4 rows → 5).
+
+
+---
+
+## Deferred
+
+Things noticed during execution that are out of scope for the task that surfaced them.
+Not committed to the diff; recorded here per `CLAUDE.md`'s scope rule.
 
 ### Request path is not tolerant of a Postgres outage
 

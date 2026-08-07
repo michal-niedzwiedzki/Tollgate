@@ -216,12 +216,27 @@ pub struct ClaimArgs<'a> {
 /// The claim script, hashed once at construction.
 pub struct ClaimScript {
     script: Script,
+    /// The reservation stream this instance `XADD`s to. Always `RESERVATIONS_KEY` in the
+    /// gateway; see `with_stream` for why it is a field at all.
+    stream: String,
 }
 
 impl ClaimScript {
     pub fn new() -> Self {
+        Self::with_stream(RESERVATIONS_KEY)
+    }
+
+    /// The stream is already `KEYS[n+2]` of the Lua script, so naming it here changes no
+    /// behaviour — it only stops the Rust caller hardcoding it.
+    ///
+    /// This exists for tests. `tg:reservations` is process-global, and several test modules
+    /// claim against it; one of them asserting "exactly one entry was appended" is then racing
+    /// every other module that happens to be running. Giving each test its own stream makes
+    /// those assertions hermetic and exact, which is why there is no lock guarding them.
+    pub fn with_stream(stream: impl Into<String>) -> Self {
         ClaimScript {
             script: Script::new(CLAIM_LUA),
+            stream: stream.into(),
         }
     }
 
@@ -249,7 +264,7 @@ impl ClaimScript {
         for cap_hash in args.cap_hashes {
             invocation.key(spent_key(cap_hash));
         }
-        invocation.key(RESERVATIONS_KEY);
+        invocation.key(self.stream.as_str());
         for cap_hash in args.cap_hashes {
             invocation.key(meta_key(cap_hash));
         }
@@ -390,11 +405,23 @@ mod claim {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::sync::Mutex;
 
-    /// Every test here appends to the single shared `tg:reservations` stream, so
-    /// the ones that assert on its length must not overlap.
-    static STREAM_LOCK: Mutex<()> = Mutex::const_new(());
+    /// Each test claims against its own throwaway stream rather than the shared
+    /// `tg:reservations`. That is what makes "exactly one entry was appended"
+    /// exact: there is no other writer, so no lock is needed and no future test
+    /// module can accidentally race these assertions by claiming concurrently.
+    fn test_script() -> (ClaimScript, String) {
+        let stream = unique("tg:test:claim");
+        (ClaimScript::with_stream(stream.clone()), stream)
+    }
+
+    async fn drop_stream(conn: &mut ConnectionManager, stream: &str) {
+        let _: () = redis::cmd("DEL")
+            .arg(stream)
+            .query_async(conn)
+            .await
+            .unwrap_or(());
+    }
 
     /// Distinct nonces and cap hashes per test, so runs do not collide with each
     /// other or with leftovers from a previous run.
@@ -433,9 +460,9 @@ mod claim {
             .unwrap_or(0)
     }
 
-    async fn stream_len(conn: &mut ConnectionManager) -> u64 {
+    async fn stream_len(conn: &mut ConnectionManager, stream: &str) -> u64 {
         redis::cmd("XLEN")
-            .arg(RESERVATIONS_KEY)
+            .arg(stream)
             .query_async(conn)
             .await
             .expect("XLEN should succeed")
@@ -473,14 +500,12 @@ mod claim {
     #[ignore = "requires a live redis"]
     async fn first_claim_returns_ok_and_a_replay_leaves_spend_unchanged() {
         let mut conn = connect().await;
-        let _guard = STREAM_LOCK.lock().await;
+        let (script, stream) = test_script();
 
         let cap = unique("cap");
         let nonce = unique("nonce");
         let caps = vec![cap.clone()];
         seed_meta(&mut conn, &cap, 1_000_000, 100_000).await;
-
-        let script = ClaimScript::new();
 
         let first = script.claim(&mut conn, args(&nonce, 1_000, &caps)).await.unwrap();
         assert_eq!(first[0], "ok", "first claim of a fresh nonce should succeed");
@@ -495,13 +520,14 @@ mod claim {
             after_first,
             "a replay must not move the spend counter"
         );
+        drop_stream(&mut conn, &stream).await;
     }
 
     #[tokio::test]
     #[ignore = "requires a live redis"]
     async fn amount_over_max_per_request_returns_cap_exceeded_naming_the_level() {
         let mut conn = connect().await;
-        let _guard = STREAM_LOCK.lock().await;
+        let (script, stream) = test_script();
 
         // Root is generous, the leaf is not: the leaf is level 1 and must be the
         // one named.
@@ -512,10 +538,7 @@ mod claim {
         seed_meta(&mut conn, &leaf, 1_000_000, 5_000).await;
 
         let nonce = unique("nonce");
-        let reply = ClaimScript::new()
-            .claim(&mut conn, args(&nonce, 6_000, &caps))
-            .await
-            .unwrap();
+        let reply = script.claim(&mut conn, args(&nonce, 6_000, &caps)).await.unwrap();
 
         assert_eq!(reply[0], "cap_exceeded");
         assert_eq!(reply[1], "1", "the leaf is level 1, root-first and 0-based");
@@ -530,20 +553,19 @@ mod claim {
             .await
             .unwrap();
         assert_eq!(exists, 0, "a rejected claim must not consume the nonce");
+        drop_stream(&mut conn, &stream).await;
     }
 
     #[tokio::test]
     #[ignore = "requires a live redis"]
     async fn spend_accumulating_past_max_total_returns_insufficient_with_remaining() {
         let mut conn = connect().await;
-        let _guard = STREAM_LOCK.lock().await;
+        let (script, stream) = test_script();
 
         let cap = unique("cap");
         let caps = vec![cap.clone()];
         // Room for exactly three charges of 1_000, with 500 left over.
         seed_meta(&mut conn, &cap, 3_500, 1_000).await;
-
-        let script = ClaimScript::new();
         for i in 0..3 {
             let nonce = unique(&format!("nonce-{i}"));
             let reply = script.claim(&mut conn, args(&nonce, 1_000, &caps)).await.unwrap();
@@ -559,24 +581,21 @@ mod claim {
         assert_eq!(reply[2], cap);
         assert_eq!(reply[3], "500", "remaining is max_total - spent, not the shortfall");
         assert_eq!(spent(&mut conn, &cap).await, 3_000, "a refusal charges nothing");
+        drop_stream(&mut conn, &stream).await;
     }
 
     #[tokio::test]
     #[ignore = "requires a live redis"]
     async fn a_successful_claim_sets_the_nonce_ttl_charges_and_appends_to_the_stream() {
         let mut conn = connect().await;
-        let _guard = STREAM_LOCK.lock().await;
+        let (script, stream) = test_script();
 
         let cap = unique("cap");
         let caps = vec![cap.clone()];
         seed_meta(&mut conn, &cap, 1_000_000, 100_000).await;
 
-        let before = stream_len(&mut conn).await;
         let nonce = unique("nonce");
-        let reply = ClaimScript::new()
-            .claim(&mut conn, args(&nonce, 2_500, &caps))
-            .await
-            .unwrap();
+        let reply = script.claim(&mut conn, args(&nonce, 2_500, &caps)).await.unwrap();
 
         assert_eq!(reply[0], "ok");
 
@@ -586,13 +605,13 @@ mod claim {
             "nonce TTL should be the requested 360s or just under, got {observed_ttl}"
         );
         assert_eq!(spent(&mut conn, &cap).await, 2_500);
-        assert_eq!(stream_len(&mut conn).await, before + 1, "one reservation appended");
+        assert_eq!(stream_len(&mut conn, &stream).await, 1, "one reservation appended");
 
         // The stream entry must carry everything the Task 3.4 drain needs to build a
         // complete `authorisations` row, because that row is the Phase 6 settler's
         // only input.
         let entries: Vec<(String, Vec<String>)> = redis::cmd("XRANGE")
-            .arg(RESERVATIONS_KEY)
+            .arg(&stream)
             .arg(&reply[1])
             .arg(&reply[1])
             .query_async(&mut conn)
@@ -613,13 +632,14 @@ mod claim {
         // Byte-identical, quotes and all: the drain re-parses this as JSONB.
         assert_eq!(fields["payload"], PAYLOAD_JSON, "payload must survive the round trip verbatim");
         assert_eq!(fields["signature"], SIGNATURE_HEX);
+        drop_stream(&mut conn, &stream).await;
     }
 
     #[tokio::test]
     #[ignore = "requires a live redis"]
     async fn a_level_without_meta_is_an_error_not_a_silent_pass() {
         let mut conn = connect().await;
-        let _guard = STREAM_LOCK.lock().await;
+        let (script, stream) = test_script();
 
         let seeded = unique("cap-seeded");
         let unseeded = unique("cap-unseeded");
@@ -627,15 +647,13 @@ mod claim {
         seed_meta(&mut conn, &seeded, 1_000_000, 100_000).await;
 
         let nonce = unique("nonce");
-        let reply = ClaimScript::new()
-            .claim(&mut conn, args(&nonce, 1_000, &caps))
-            .await
-            .unwrap();
+        let reply = script.claim(&mut conn, args(&nonce, 1_000, &caps)).await.unwrap();
 
         assert_eq!(reply[0], "missing_meta");
         assert_eq!(reply[1], "1");
         assert_eq!(reply[2], unseeded);
         assert_eq!(spent(&mut conn, &seeded).await, 0, "an unmetered level charges nothing");
+        drop_stream(&mut conn, &stream).await;
     }
 
     /// The v1 race in architecture.md §9.1: check-then-decrement across three round
@@ -645,7 +663,7 @@ mod claim {
     #[ignore = "requires a live redis"]
     async fn one_hundred_concurrent_claims_stop_exactly_at_max_total() {
         let mut conn = connect().await;
-        let _guard = STREAM_LOCK.lock().await;
+        let (script, stream) = test_script();
 
         const AMOUNT: u128 = 1_000;
         const PERMITTED: u128 = 50;
@@ -653,7 +671,7 @@ mod claim {
         let cap = unique("cap");
         seed_meta(&mut conn, &cap, AMOUNT * PERMITTED, AMOUNT).await;
 
-        let script = std::sync::Arc::new(ClaimScript::new());
+        let script = std::sync::Arc::new(script);
         let caps = std::sync::Arc::new(vec![cap.clone()]);
 
         let mut handles = Vec::with_capacity(100);
@@ -688,6 +706,7 @@ mod claim {
             AMOUNT * PERMITTED,
             "total spend must never exceed max_total"
         );
+        drop_stream(&mut conn, &stream).await;
     }
 }
 
@@ -746,13 +765,30 @@ mod multilevel {
         hashes
     }
 
+    /// A throwaway stream per test, never `tg:reservations`. These tests do not assert on
+    /// stream length, but every claim `XADD`s, and writing into the shared stream is what made
+    /// `mod claim`'s length assertions flaky.
+    fn test_script() -> (ClaimScript, String) {
+        let stream = unique("tg:test:multilevel");
+        (ClaimScript::with_stream(stream.clone()), stream)
+    }
+
+    async fn drop_stream(conn: &mut ConnectionManager, stream: &str) {
+        let _: () = redis::cmd("DEL")
+            .arg(stream)
+            .query_async(conn)
+            .await
+            .unwrap_or(());
+    }
+
     async fn claim(
+        script: &ClaimScript,
         conn: &mut ConnectionManager,
         nonce: &str,
         amount: u128,
         hashes: &[String],
     ) -> ClaimOutcome {
-        ClaimScript::new()
+        script
             .submit(
                 conn,
                 ClaimRequest {
@@ -779,9 +815,10 @@ mod multilevel {
     #[ignore = "requires a live redis"]
     async fn one_charge_increments_every_level() {
         let mut conn = connect().await;
+        let (script, stream) = test_script();
         let hashes = chain(&mut conn, [(1_000_000, 100_000); 3]).await;
 
-        let outcome = claim(&mut conn, &unique("nonce"), 10_000, &hashes).await;
+        let outcome = claim(&script, &mut conn, &unique("nonce"), 10_000, &hashes).await;
         assert!(matches!(outcome, ClaimOutcome::Ok { .. }));
 
         for (level, hash) in hashes.iter().enumerate() {
@@ -791,16 +828,18 @@ mod multilevel {
                 "level {level} must be charged, not just the leaf"
             );
         }
+        drop_stream(&mut conn, &stream).await;
     }
 
     #[tokio::test]
     #[ignore = "requires a live redis"]
     async fn a_void_credits_every_level_back() {
         let mut conn = connect().await;
+        let (script, stream) = test_script();
         let hashes = chain(&mut conn, [(1_000_000, 100_000); 3]).await;
 
         assert!(matches!(
-            claim(&mut conn, &unique("nonce"), 10_000, &hashes).await,
+            claim(&script, &mut conn, &unique("nonce"), 10_000, &hashes).await,
             ClaimOutcome::Ok { .. }
         ));
         void(&mut conn, &hashes, 10_000)
@@ -814,12 +853,14 @@ mod multilevel {
                 "level {level} must be credited back; an upstream failure charges nobody"
             );
         }
+        drop_stream(&mut conn, &stream).await;
     }
 
     #[tokio::test]
     #[ignore = "requires a live redis"]
     async fn a_leaf_with_a_small_max_total_trips_first_and_names_level_two() {
         let mut conn = connect().await;
+        let (script, stream) = test_script();
         // Ancestors are generous; the worker's own budget is what runs out.
         let hashes = chain(
             &mut conn,
@@ -828,11 +869,11 @@ mod multilevel {
         .await;
 
         assert!(matches!(
-            claim(&mut conn, &unique("nonce"), 10_000, &hashes).await,
+            claim(&script, &mut conn, &unique("nonce"), 10_000, &hashes).await,
             ClaimOutcome::Ok { .. }
         ));
 
-        match claim(&mut conn, &unique("nonce"), 10_000, &hashes).await {
+        match claim(&script, &mut conn, &unique("nonce"), 10_000, &hashes).await {
             ClaimOutcome::Insufficient {
                 level,
                 cap_hash,
@@ -847,6 +888,7 @@ mod multilevel {
 
         // The refused charge moved nothing anywhere.
         assert_eq!(spent(&mut conn, &hashes[0]).await, 10_000);
+        drop_stream(&mut conn, &stream).await;
     }
 
     /// The supervisor's pool emptying stops a worker that still has room of its own. This is
@@ -855,6 +897,7 @@ mod multilevel {
     #[ignore = "requires a live redis"]
     async fn a_root_with_a_small_max_total_trips_even_when_the_leaf_has_room() {
         let mut conn = connect().await;
+        let (script, stream) = test_script();
         let hashes = chain(
             &mut conn,
             [(15_000, 100_000), (1_000_000, 100_000), (1_000_000, 100_000)],
@@ -862,11 +905,11 @@ mod multilevel {
         .await;
 
         assert!(matches!(
-            claim(&mut conn, &unique("nonce"), 10_000, &hashes).await,
+            claim(&script, &mut conn, &unique("nonce"), 10_000, &hashes).await,
             ClaimOutcome::Ok { .. }
         ));
 
-        match claim(&mut conn, &unique("nonce"), 10_000, &hashes).await {
+        match claim(&script, &mut conn, &unique("nonce"), 10_000, &hashes).await {
             ClaimOutcome::Insufficient {
                 level,
                 cap_hash,
@@ -881,19 +924,21 @@ mod multilevel {
 
         // The leaf had plenty left and is untouched by the refusal.
         assert_eq!(spent(&mut conn, &hashes[2]).await, 10_000);
+        drop_stream(&mut conn, &stream).await;
     }
 
     #[tokio::test]
     #[ignore = "requires a live redis"]
     async fn a_per_request_cap_at_any_level_names_that_level() {
         let mut conn = connect().await;
+        let (script, stream) = test_script();
         let hashes = chain(
             &mut conn,
             [(1_000_000, 100_000), (1_000_000, 5_000), (1_000_000, 100_000)],
         )
         .await;
 
-        match claim(&mut conn, &unique("nonce"), 10_000, &hashes).await {
+        match claim(&script, &mut conn, &unique("nonce"), 10_000, &hashes).await {
             ClaimOutcome::CapExceeded {
                 level,
                 cap_hash,
@@ -909,6 +954,7 @@ mod multilevel {
         for hash in &hashes {
             assert_eq!(spent(&mut conn, hash).await, 0, "a refusal charges nothing");
         }
+        drop_stream(&mut conn, &stream).await;
     }
 }
 
