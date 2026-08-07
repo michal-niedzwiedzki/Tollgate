@@ -8,8 +8,9 @@ for the plan as a whole, for things the plan itself left open.
 
 ### Phase 5 — capability delegation
 
-Settled 2026-08-06, before Task 5.1, from a read of `plan.md` §Phase 5, `architecture.md` §5 and
-§9.3, and the Phase 0–4 code as built. Ten decisions, D1–D10.
+Settled 2026-08-06 from a read of `plan.md` §Phase 5, `architecture.md` §5 and §9.3, and the
+Phase 0–4 code as built. Eleven decisions: D1–D10 before Task 5.1, and D11 after the Phase 5 Gate
+run, which is the one that surfaced it.
 
 **D1. The capability header stays optional, permanently. This is the load-bearing one.**
 
@@ -147,6 +148,33 @@ which passed without it. Building it during 5.1 would have been scope this proje
 explicitly forbid. Task 5.3 is the first task whose verification actually needs a signed chain on
 the wire, so it lands there. `capability_vectors.json` exists as of 5.1 either way, so the harness
 has vectors to check itself against whenever it is written.
+
+**D11. Exhausting a total cap is 402, not 429. The Phase 5 Gate's wording was corrected, the
+code was not.**
+
+Settled 2026-08-06, after the Phase 5 Gate run, which failed on exactly this line.
+
+The gate said worker 2 "hits its cap and receives **429**". It receives **402
+`insufficient_funds`**. Four sources agree the code is right and the gate line was wrong:
+
+- `architecture.md` §4.3 — *Insufficient budget* → 402 `insufficient_funds`; *Cap exceeded* → 429
+  `cap_exceeded`. A **total** cap running out is the former; a **per-request** cap violation is
+  the latter.
+- `plan.md` Task 3.3 — implements precisely that split, and is committed.
+- The **Phase 3 Gate** asserts both halves: "50 `insufficient_funds`" for budget exhaustion and
+  "Cap exceeded returns 429" for the per-request cap. Making worker 2's refusal a 429 would have
+  broken the first.
+- **`prd.md` §9 step 3, the requirement the gate line claims to encode, specifies no status code
+  at all** — only that worker 2 "hits its cap mid-task and stops". Nothing in the product spec
+  ever asked for 429 here.
+
+So the Phase 5 Gate line was the lone outlier and has been corrected in `plan.md`, with the
+reasoning inline there. This is the only edit made to `plan.md` in this project.
+
+What the gate actually cares about — *which* level said no — holds either way, because Task 5.4
+gave the 402 body the same `tripped_level`, `capability_hash` and per-level `chain` the 429
+carries. Observed under real concurrency: workers 1 and 3 succeed 6/6, worker 2 succeeds exactly
+twice against its 0.10 cap and is then refused with `tripped_level: 1`, its own capability.
 
 ---
 

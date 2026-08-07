@@ -1213,10 +1213,20 @@ This gate proves the headline feature. `prd.md` F3 and F4 complete here.
 - [ ] Every one of the ten attenuation/binding violations in Task 5.3 is rejected with its documented
       status code and reason
 - [ ] **The `prd.md` §9 step 3 scenario:** three workers with different caps run concurrently; worker
-      2 hits its cap and receives 429 while workers 1 and 3 continue succeeding
+      2 hits its cap and is refused — **402 `insufficient_funds`**, naming its own capability as the
+      tripped level — while workers 1 and 3 continue succeeding
+
+      > Corrected 2026-08-06: this line originally said 429. Exhausting a **total** cap is
+      > `insufficient_funds` → **402** (`architecture.md` §4.3, implemented in Task 3.3, and asserted
+      > by the Phase 3 Gate's "50 `insufficient_funds`"). **429 `cap_exceeded`** is the **per-request**
+      > cap, which is the item two lines below. `prd.md` §9 step 3 — the requirement this encodes —
+      > names no status code, only that worker 2 "hits its cap mid-task and stops". Changing the code
+      > to 429 here would have regressed the Phase 3 Gate. See `NOTES.md` decision D11.
+
 - [ ] When the supervisor's pool empties, all three workers stop at once even though none has hit its
       own cap
 - [ ] The 429 body contains the tripped level, the capability hash, and remaining budget per level
+      (the 402 body carries the same three, so either refusal is equally diagnosable)
 - [ ] A revoked capability is refused; revoking a parent refuses the child
 - [ ] `FLUSHALL` + restart restores exact spend from Postgres with no overspend window
 - [ ] A stolen capability presented by a different signer is refused (`subject_mismatch`)
