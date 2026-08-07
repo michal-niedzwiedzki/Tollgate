@@ -558,6 +558,47 @@ Notable tests, if you want to read the ones that carry the weight:
 
 ---
 
+## Settlement cost
+
+`prd.md` §8 claims settlement costs under $0.001 per request after batching, "verified with `forge`
+gas snapshots, not estimated". Here is the measurement rather than the estimate.
+
+Run `cd contracts && forge test -vv`; the 50-item test measures the `settle` call with `gasleft()`
+and logs it. `contracts/.gas-snapshot` is committed alongside.
+
+```
+settle(50) execution gas: 2042281
+execution gas per charge:   40845
+```
+
+Per charge, for a full batch of 50:
+
+| Component | Gas | Note |
+|---|---:|---|
+| Execution | 40,846 | measured, real USDC on a Base Sepolia fork |
+| Intrinsic | 420 | 21,000 amortised across 50 |
+| Calldata | 3,248 | one `Auth` is 320 bytes; 156 zero @ 4, 164 non-zero @ 16 |
+| **Total** | **44,514** | |
+
+At Base's gas price of 0.006 gwei (`cast gas-price`, live at time of writing):
+
+| ETH price | Cost per charge |
+|---|---:|
+| $2,000 | $0.00053 |
+| $3,000 | $0.00080 |
+| $4,000 | $0.00107 |
+
+**The claim holds, but not by an order of magnitude.** At this gas price it breaks even with
+$0.001 at an ETH price around **$3,744**. Two caveats worth stating rather than burying:
+
+- This excludes Base's **L1 data-availability fee**, which a calldata-heavy batch does incur. The
+  real all-in figure comes from Task 6.6's live Base Sepolia settlement, and this section will be
+  replaced by that measurement.
+- Execution gas came in at ~41k per charge against `architecture.md` §6's 60–80k estimate, so the
+  batch lands near 2.0M gas rather than the 3.5M that section predicted.
+
+---
+
 ## Configuration
 
 | Variable | Required | Default | Used by |

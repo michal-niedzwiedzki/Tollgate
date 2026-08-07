@@ -1,0 +1,4 @@
+BatchSettlerTest:test_a_batch_of_fifty_valid_auths_succeeds() (gas: 2386036)
+BatchSettlerTest:test_a_used_nonce_does_not_revert_the_batch() (gas: 175748)
+BatchSettlerTest:test_an_empty_batch_is_a_noop() (gas: 9711)
+BatchSettlerTest:test_three_valid_auths_all_settle() (gas: 174184)
