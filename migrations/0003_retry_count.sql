@@ -1,0 +1,11 @@
+-- architecture.md §4.3, last row: "That item alone requeues with a retry counter. The other 49
+-- settle. Alert after 3 failures."
+--
+-- A `SettleFailed` item is one the chain refused — a spent nonce, an expired authorisation, an
+-- insufficient balance. Retrying it is worth doing, because some of those are transient, but
+-- retrying forever is not: an authorisation whose `validBefore` has passed can never succeed and
+-- would otherwise be resubmitted in every batch for the life of the system.
+--
+-- The counter is NOT NULL DEFAULT 0 so every existing row starts with a full retry budget, which
+-- is the right reading: none of them has been refused yet.
+ALTER TABLE authorisations ADD COLUMN retry_count INT NOT NULL DEFAULT 0;

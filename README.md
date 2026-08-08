@@ -610,6 +610,39 @@ live run: it must be a plain EOA.
 
 ---
 
+## Settlement worker
+
+A separate binary and a separate process. Nothing it does is on the request path — the caller
+already has the upstream's response by the time a row becomes visible to it.
+
+```bash
+cargo run -p tollgate-settler
+```
+
+It flushes at `SETTLER_BATCH_SIZE` authorisations or `SETTLER_FLUSH_SECONDS`, whichever comes
+first, submits one `BatchSettler.settle` transaction, and writes back `status='settled'`,
+`tx_hash` and `settled_at` for every nonce the chain reported as `Settled`.
+
+Three properties worth knowing:
+
+- **It reads only `status = 'queued'`.** A `reserved` row — one whose upstream call has not
+  returned 2xx yet — is invisible to it by construction. That is what closes the v1 race where a
+  flush could settle a charge the request handler was about to void.
+- **`batch_id` is `keccak256` over the sorted nonce set**, stamped inside the same transaction
+  that selects the rows, with `FOR UPDATE SKIP LOCKED`. The same set of charges always produces
+  the same id, so a duplicate submission is recognisable rather than looking like new work.
+- **Gas is EIP-1559 with a fixed multiplier — twice the latest base fee, plus a constant
+  priority fee.** There is no gas oracle and no dependency on one.
+
+**Throughput ceiling, stated rather than hidden.** One in-flight transaction at a time, awaited
+to completion before the next batch, so the settler EOA's nonces stay sequential. That is roughly
+one batch per block: at 50 per batch and Base's 2-second blocks, **~25 settlements per second
+sustained**. That is comfortably above `prd.md` §8's target of 100 requests in 60 seconds, but it
+is a real ceiling. The production fix is several settler EOAs behind a nonce allocator, which is
+not built.
+
+---
+
 ## Settlement cost
 
 `prd.md` §8 claims settlement costs under $0.001 per request after batching, "verified with `forge`

@@ -5,3 +5,22 @@ edition = "2024"
 
 [dependencies]
 tollgate-core = { path = "../tollgate-core" }
+tokio = { workspace = true }
+sqlx = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+anyhow = { workspace = true }
+alloy = { workspace = true, default-features = false, features = [
+    "std",
+    "sol-types",
+    "eip712",
+    "k256",
+    "contract",
+    "network",
+    "providers",
+    "provider-http",
+    "reqwest-rustls-tls",
+    "signer-local",
+    "rpc-types-eth",
+] }
