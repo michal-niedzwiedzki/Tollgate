@@ -7,6 +7,7 @@ use crate::state::AppState;
 
 pub mod budgets;
 pub mod capabilities;
+pub mod expense;
 pub mod providers;
 pub mod proxy;
 pub mod receipts;

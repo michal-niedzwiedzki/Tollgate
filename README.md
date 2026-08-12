@@ -346,7 +346,8 @@ is `403 not_authorised_to_revoke`. Revocations may not be future-dated.
 | `GET` | `/v1/capabilities/{hash}` | Stored capability with `revoked_at` and live spend from Redis |
 | `POST` | `/v1/capabilities/{hash}/revoke` | Signed EIP-712 revocation |
 | `GET` | `/v1/receipts/{nonce}` | Signed receipt for a charge, plus `tx_hash` once settled; `404 receipt_not_issued` if the charge was voided or is still in flight |
-| `GET` | `/v1/gateway-key` | The address that signs receipts, and the EIP-712 domain to verify them under |
+| `GET` | `/v1/expense-report` | `?capability=0x…` for a delegation subtree, or `?payer=0x…` for a payer-level budget. Signed; see below |
+| `GET` | `/v1/gateway-key` | The address that signs receipts and expense reports, and the EIP-712 domain to verify them under |
 | `ANY` | `/v1/proxy/{slug}/{*path}` | The paid path |
 
 Every error uses one shared body, defined once in `tollgate-core/src/error.rs`:
@@ -357,6 +358,24 @@ Every error uses one shared body, defined once in `tollgate-core/src/error.rs`:
 
 Prices are submitted as decimal USDC strings (`"0.001"`) and converted server-side to base units
 (6 decimals) — that request registers a provider charging `1000` wei of USDC per call.
+
+### Verifying a signed expense report
+
+A report is a variable-depth tree, which EIP-712 cannot hash directly, so the signature covers
+`ExpenseReport { bytes32 bodyHash; uint64 timestamp; }` under the same Tollgate domain receipts
+use. `bodyHash` is `keccak256` of the response body with `generated_at` and `signature` removed —
+neither can be inside its own digest — serialised as **compact JSON with sorted keys**:
+
+```python
+body = {k: v for k, v in report.items() if k not in ("generated_at", "signature")}
+body_hash = keccak(json.dumps(body, sort_keys=True, separators=(",", ":")).encode())
+# then recover ExpenseReport{bodyHash, timestamp=report["generated_at"]} and compare
+# against the address from GET /v1/gateway-key
+```
+
+Amounts in the report are decimal USDC strings (`"0.42"`), not base units, and figures come from
+the Postgres ledger rather than the Redis counters. `voided` charges are excluded from every
+total; `failed` ones are included and also counted in `failed_count`. See NOTES.md D15 and D16.
 
 ### Status codes on the paid path
 

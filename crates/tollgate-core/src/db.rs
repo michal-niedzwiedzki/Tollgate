@@ -207,6 +207,31 @@ pub async fn capability_issuers(pool: &PgPool, hash: &[u8]) -> Result<Vec<Addres
     rows.iter().map(|(issuer,)| bytea_to_address(issuer)).collect()
 }
 
+/// The capability at `hash` and every capability delegated below it, for the expense report
+/// (Task 7.2). The mirror image of `capability_issuers`, which walks the same self-referencing
+/// `parent_hash` edge upwards: authority flows down, so a report rooted at a supervisor covers
+/// everything that supervisor's grant made possible.
+///
+/// Ordered by depth so a caller assembling the tree always sees a parent before its children.
+/// Returns an empty vec when `hash` names no capability, which the caller reads as a 404 rather
+/// than as an empty report.
+pub async fn capability_subtree(pool: &PgPool, hash: &[u8]) -> Result<Vec<StoredCapability>> {
+    let rows: Vec<CapabilityRow> = sqlx::query_as(&format!(
+        "WITH RECURSIVE descendants AS (
+             SELECT * FROM capabilities WHERE hash = $1
+           UNION ALL
+             SELECT c.* FROM capabilities c
+             JOIN descendants d ON c.parent_hash = d.hash
+         )
+         SELECT {CAPABILITY_COLUMNS} FROM descendants ORDER BY depth, hash"
+    ))
+    .bind(hash)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter().map(StoredCapability::try_from).collect()
+}
+
 /// Every capability, for rehydrating `tg:cap:{hash}:meta` and `tg:revoked` at boot
 /// (Task 5.6). Ordered by depth so a reader sees roots before their children.
 pub async fn list_capabilities(pool: &PgPool) -> Result<Vec<StoredCapability>> {

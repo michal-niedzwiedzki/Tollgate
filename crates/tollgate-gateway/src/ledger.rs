@@ -742,6 +742,117 @@ pub async fn fetch_receipt(pg: &PgPool, nonce: B256) -> Result<ReceiptLookup, St
     })
 }
 
+sol! {
+    /// The signature over an expense report (Task 7.2, prd.md user story 8: "a **signed**
+    /// expense report").
+    ///
+    /// A report is a variable-depth tree plus a variable-length charge list, which EIP-712
+    /// cannot hash directly, so the signature commits to it through `bodyHash`: the keccak of
+    /// the exact JSON body served. `timestamp` is signed alongside rather than embedded in the
+    /// body, which keeps the hashed bytes free of any field a verifier has to special-case —
+    /// see `expense_report_body_hash` for the recipe both sides follow.
+    #[derive(Debug)]
+    struct ExpenseReport {
+        bytes32 bodyHash;
+        uint64 timestamp;
+    }
+}
+
+/// The digest an expense report's signature covers: `keccak256` of the report body, serialised
+/// as compact JSON with object keys in sorted order.
+///
+/// Sorted and compact is not a stylistic choice, it is the whole contract — a verifier in
+/// another language (the Phase 8 Python client) has to reproduce these bytes exactly.
+/// `serde_json`'s `Map` is a `BTreeMap` here, so serialising is already canonical, and
+/// `json.dumps(body, sort_keys=True, separators=(",", ":"))` reproduces it in Python.
+///
+/// The body hashed is the served object **minus `generated_at` and `signature`**, the two
+/// fields that cannot be inside their own digest.
+pub fn expense_report_body_hash(body: &serde_json::Value) -> B256 {
+    alloy::primitives::keccak256(body.to_string().as_bytes())
+}
+
+/// Signs a report body under the same Tollgate domain as receipts, so one published address
+/// (`GET /v1/gateway-key`) verifies both.
+pub fn sign_expense_report(
+    signer: &PrivateKeySigner,
+    chain_id: u64,
+    body_hash: B256,
+    timestamp: u64,
+) -> Result<Vec<u8>, alloy::signers::Error> {
+    let report = ExpenseReport {
+        bodyHash: body_hash,
+        timestamp,
+    };
+    let signing_hash = report.eip712_signing_hash(&crate::capability::domain(chain_id));
+    Ok(signer.sign_hash_sync(&signing_hash)?.as_bytes().to_vec())
+}
+
+/// One charge drawn against some capability in the reported subtree.
+#[derive(sqlx::FromRow)]
+pub struct Charge {
+    pub nonce: Vec<u8>,
+    pub provider_slug: Option<String>,
+    pub amount_wei: String,
+    pub upstream_status: Option<i32>,
+    pub tx_hash: Option<Vec<u8>>,
+    pub settled_at: Option<String>,
+    pub receipt_sig: Option<Vec<u8>>,
+    pub status: String,
+}
+
+/// Every charge that drew against any of `hashes`, newest first (Task 7.2: "aggregate
+/// `authorisations` whose `chain_hashes` contains any node").
+///
+/// `voided` is excluded here rather than by the caller, because a voided charge delivered
+/// nothing and credited its budget back — including it would make `total_spent` disagree with
+/// the counters the gateway actually enforces. `failed` charges stay: the caller received the
+/// upstream's work and only the on-chain settlement reverted, so the budget was genuinely
+/// consumed (the same reasoning as NOTES.md D8). They are counted separately so a reader can
+/// see that a charge is owed but unsettled.
+pub async fn charges_for_capabilities(
+    pg: &PgPool,
+    hashes: &[Vec<u8>],
+) -> Result<Vec<Charge>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT nonce, provider_slug, amount_wei::TEXT AS amount_wei, upstream_status, tx_hash,
+                settled_at::TEXT AS settled_at, receipt_sig, status
+           FROM authorisations
+          WHERE chain_hashes && $1 AND status <> 'voided'
+          ORDER BY created_at DESC",
+    )
+    .bind(hashes)
+    .fetch_all(pg)
+    .await
+}
+
+/// Spend per capability, for the levels in `hashes` (Task 7.2).
+///
+/// Deliberately read from Postgres rather than from the Redis `tg:cap:{hash}:spent` counters.
+/// The counters are a projection that the ledger is rebuilt from (architecture.md §9.3), and a
+/// report is an auditable artifact — it should be derived from the truth, not from the cache in
+/// front of it. Under normal operation the two agree exactly; where they do not, the ledger is
+/// the one worth signing.
+///
+/// Excludes `voided` on the same grounds as `charges_for_capabilities`, so a node's `spent`
+/// and the charges listed beneath it always add up.
+pub async fn spend_by_capabilities(
+    pg: &PgPool,
+    hashes: &[Vec<u8>],
+) -> Result<HashMap<Vec<u8>, String>, sqlx::Error> {
+    let rows: Vec<(Vec<u8>, String)> = sqlx::query_as(
+        "SELECT h, SUM(amount_wei)::TEXT
+           FROM authorisations, unnest(chain_hashes) AS h
+          WHERE h = ANY($1) AND status <> 'voided'
+          GROUP BY h",
+    )
+    .bind(hashes)
+    .fetch_all(pg)
+    .await?;
+
+    Ok(rows.into_iter().collect())
+}
+
 #[cfg(test)]
 mod outcome_race {
     use super::*;

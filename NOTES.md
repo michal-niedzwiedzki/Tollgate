@@ -230,6 +230,55 @@ decided-but-not-yet-writable state, and one key means one write and no new order
 between two keys that could be observed half-applied. `COALESCE` in the UPDATE means whichever
 path runs second cannot blank what the first stored.
 
+**D15. The expense report signature commits to a body hash, and the canonical form is
+sorted-key compact JSON.**
+
+Settled 2026-08-12, during Task 7.2.
+
+`prd.md` story 8 wants a *signed* expense report, but a report is a variable-depth tree plus a
+variable-length charge list and EIP-712 has no way to hash that directly. So the signed struct is
+
+```solidity
+struct ExpenseReport { bytes32 bodyHash; uint64 timestamp; }
+```
+
+where `bodyHash = keccak256(the exact JSON body served)`.
+
+The canonical form is **compact JSON with object keys sorted** — `serde_json`'s `Map` is a
+`BTreeMap` here, so serialising is already canonical, and
+`json.dumps(body, sort_keys=True, separators=(",", ":"))` reproduces it byte-for-byte in Python.
+That equivalence is the whole contract, and it is pinned by
+`routes::expense::tests::the_signed_body_serialises_canonically` on the Rust side and exercised
+against the live endpoint from Python during this task's verification.
+
+`generated_at` and `signature` are **excluded** from the hashed body — neither can be inside its
+own digest — and the timestamp is signed in the struct instead. That is why they are added to
+the response object after hashing rather than being part of it: a verifier strips exactly those
+two keys, re-serialises, and hashes. No field is duplicated between the body and the struct, so
+there is nothing for the two to disagree about.
+
+**D16. Report figures come from Postgres, not from the Redis counters.**
+
+`/v1/capabilities/{hash}` reports live spend from `tg:cap:{hash}:spent`, because that is what
+the claim script enforces against. The expense report deliberately does not: Redis is a
+projection and Postgres is the truth (architecture.md §9.3), and a signed, auditable artifact
+should be derived from the ledger rather than from the cache in front of it. Under normal
+operation the two agree exactly; where they diverge, the ledger is the one worth signing.
+
+The one exception is a payer-level report's `max_total`, which exists **only** in Redis — a
+payer budget is seeded by `POST /v1/budgets` and has no `capabilities` row (D1). Its `spent`
+still comes from the ledger like every other node.
+
+Two consequences worth stating:
+
+- `voided` is excluded from both `total_spent` and every node's `spent`, so a node's figure and
+  the charges listed beneath it always add up. `failed` charges are **included** in the totals
+  and counted separately in `failed_count` — the caller received the upstream's work and only
+  the on-chain settlement reverted, so the budget was genuinely consumed. Same reasoning as D8.
+- A node's `spent` is not the sum of its children's. It does not need to be: every charge
+  decrements every level of its chain (architecture.md §5.2), so a supervisor's counter is
+  already the whole subtree's total. Summing children here would double-count.
+
 ---
 
 ## Fixed

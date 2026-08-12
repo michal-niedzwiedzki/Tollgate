@@ -95,6 +95,10 @@ async fn main() -> anyhow::Result<()> {
             post(routes::capabilities::revoke_capability),
         )
         .route("/v1/receipts/{nonce}", get(routes::receipts::get_receipt))
+        .route(
+            "/v1/expense-report",
+            get(routes::expense::expense_report),
+        )
         .route("/v1/gateway-key", get(routes::receipts::gateway_key))
         .route(
             "/v1/proxy/{provider_slug}/{*path}",
