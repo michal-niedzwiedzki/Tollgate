@@ -345,6 +345,8 @@ is `403 not_authorised_to_revoke`. Revocations may not be future-dated.
 | `POST` | `/v1/budgets` | **Dev only.** Seed a payer-level budget: `{payer, max_total, max_per_request}` |
 | `GET` | `/v1/capabilities/{hash}` | Stored capability with `revoked_at` and live spend from Redis |
 | `POST` | `/v1/capabilities/{hash}/revoke` | Signed EIP-712 revocation |
+| `GET` | `/v1/receipts/{nonce}` | Signed receipt for a charge, plus `tx_hash` once settled; `404 receipt_not_issued` if the charge was voided or is still in flight |
+| `GET` | `/v1/gateway-key` | The address that signs receipts, and the EIP-712 domain to verify them under |
 | `ANY` | `/v1/proxy/{slug}/{*path}` | The paid path |
 
 Every error uses one shared body, defined once in `tollgate-core/src/error.rs`:

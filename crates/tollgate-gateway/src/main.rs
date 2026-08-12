@@ -56,6 +56,17 @@ async fn main() -> anyhow::Result<()> {
 
     let proxy_client = proxy::build_client();
 
+    // Parsed here, not on the request path: a bad key must stop the gateway starting rather
+    // than surface later as a charge that returned 200 with no receipt attached.
+    let receipt_signer: alloy::signers::local::PrivateKeySigner = cfg
+        .gateway_signing_key
+        .parse()
+        .map_err(|e| anyhow::anyhow!("GATEWAY_SIGNING_KEY is not a valid private key: {e}"))?;
+    tracing::info!(
+        address = %receipt_signer.address(),
+        "loaded the gateway receipt signing key"
+    );
+
     let state = AppState {
         cfg: Arc::new(cfg),
         pg,
@@ -63,6 +74,7 @@ async fn main() -> anyhow::Result<()> {
         claim_script: Arc::new(claim_script),
         proxy_client,
         prometheus_handle,
+        receipt_signer: Arc::new(receipt_signer),
     };
 
     let app = Router::new()
@@ -82,6 +94,8 @@ async fn main() -> anyhow::Result<()> {
             "/v1/capabilities/{hash}/revoke",
             post(routes::capabilities::revoke_capability),
         )
+        .route("/v1/receipts/{nonce}", get(routes::receipts::get_receipt))
+        .route("/v1/gateway-key", get(routes::receipts::gateway_key))
         .route(
             "/v1/proxy/{provider_slug}/{*path}",
             any(routes::proxy::handle_proxy_request),

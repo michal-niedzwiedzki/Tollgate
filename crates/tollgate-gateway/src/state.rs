@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use alloy::signers::local::PrivateKeySigner;
 use metrics_exporter_prometheus::PrometheusHandle;
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
@@ -21,4 +22,8 @@ pub struct AppState {
     /// pinned connector, built once so pooling matters for the latency budget).
     pub proxy_client: ProxyClient,
     pub prometheus_handle: PrometheusHandle,
+    /// Signs per-charge receipts (Task 7.1). Parsed once at startup, so a malformed
+    /// `GATEWAY_SIGNING_KEY` is a boot failure rather than a receipt that silently never gets
+    /// signed. Its address is published at `GET /v1/gateway-key`.
+    pub receipt_signer: Arc<PrivateKeySigner>,
 }

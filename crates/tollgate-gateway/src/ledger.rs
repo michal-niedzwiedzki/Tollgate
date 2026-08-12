@@ -7,9 +7,16 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use alloy::primitives::{Address, Bytes, B256};
+use alloy::signers::local::PrivateKeySigner;
+use alloy::signers::SignerSync;
+use alloy::sol;
+use alloy::sol_types::SolStruct;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::Value;
 use sqlx::PgPool;
+use tollgate_core::types::{bytea_to_address, bytea_to_b256, numeric_to_u256};
 
 use crate::policy::RESERVATIONS_KEY;
 
@@ -23,6 +30,92 @@ const BLOCK_MS: usize = 1000;
 /// finishing before the drain has inserted a row for that nonce yet: see
 /// `mark_outcome` and `insert_reservation`.
 const OUTCOME_MARKER_TTL_SECS: u64 = 3600;
+
+sol! {
+    /// The per-charge spend receipt (Task 7.1, prd.md F6). What the chain cannot show:
+    /// *which* endpoint was called, on whose delegated budget, and whether the upstream
+    /// actually returned 200. A `Transfer` event proves money moved; this proves what it
+    /// bought.
+    ///
+    /// Signed by the gateway, so its trust story is different from a capability's: a
+    /// capability is signed by an agent and the gateway is the verifier, whereas here the
+    /// gateway is the *attester* and the payer, the provider and whoever funded the run are
+    /// all verifiers. `GET /v1/gateway-key` publishes the address that closes that loop.
+    ///
+    /// `capabilityHash` is `0x0` when the charge carried no capability chain — the permanent
+    /// payer-level path of NOTES.md D1. That mirrors `authorisations.capability_hash` being
+    /// SQL NULL for exactly those rows, which is what lets `GET /v1/receipts/{nonce}`
+    /// reconstruct the signed body from the row byte-for-byte.
+    #[derive(Debug)]
+    struct Receipt {
+        bytes32 nonce;
+        address payer;
+        bytes32 capabilityHash;
+        string providerSlug;
+        uint256 amount;
+        uint16 upstreamStatus;
+        uint64 timestamp;
+    }
+}
+
+/// A receipt and the gateway signature over it. The two travel together everywhere: in the
+/// `X-Tollgate-Receipt` response header, and out of `GET /v1/receipts/{nonce}`. Handing back
+/// a signature without the exact body it covers would make it unverifiable.
+#[derive(Debug)]
+pub struct SignedReceipt {
+    pub receipt: Receipt,
+    pub signature: Vec<u8>,
+}
+
+/// Signs `receipt` under the Tollgate EIP-712 domain — the same domain a capability and a
+/// revocation use, so `chainId` is the cross-chain replay guard here too (architecture.md
+/// §10). The struct's own type hash is what keeps the three apart: a signature over a
+/// `Receipt` can never be read as a `Capability`.
+pub fn sign_receipt(
+    signer: &PrivateKeySigner,
+    chain_id: u64,
+    receipt: Receipt,
+) -> Result<SignedReceipt, alloy::signers::Error> {
+    let signing_hash = receipt.eip712_signing_hash(&crate::capability::domain(chain_id));
+    let signature = signer.sign_hash_sync(&signing_hash)?;
+    Ok(SignedReceipt {
+        receipt,
+        signature: signature.as_bytes().to_vec(),
+    })
+}
+
+impl SignedReceipt {
+    /// The wire form, used identically by the response header and the lookup endpoint so a
+    /// client has one shape to parse and one shape to verify against.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "nonce": self.receipt.nonce.to_string(),
+            "payer": self.receipt.payer.to_string(),
+            "capability_hash": self.receipt.capabilityHash.to_string(),
+            "provider_slug": self.receipt.providerSlug,
+            "amount": self.receipt.amount.to_string(),
+            "upstream_status": self.receipt.upstreamStatus,
+            "timestamp": self.receipt.timestamp,
+            "signature": alloy::hex::encode_prefixed(&self.signature),
+        })
+    }
+
+    /// Base64 of `to_json`, for `X-Tollgate-Receipt`. Base64 so the JSON's quotes and braces
+    /// cannot collide with header syntax, matching how `X-PAYMENT` carries its payload.
+    pub fn to_header_value(&self) -> String {
+        BASE64.encode(self.to_json().to_string())
+    }
+
+    /// `(issued_at, signature)` — everything the promotion path must persist beyond the
+    /// columns it already writes.
+    pub fn stored(&self) -> (u64, &[u8]) {
+        (self.receipt.timestamp, self.signature.as_slice())
+    }
+}
+
+/// A receipt as it travels between the request path and the ledger: `(issued_at, signature)`,
+/// the two things a promotion has to persist beyond the columns it already writes.
+type StoredReceipt = (u64, Vec<u8>);
 
 /// Where a reservation ends up once the proxy round trip is known:
 /// architecture.md §4.2 step 7. A 2xx promotes it to `queued`, settleable;
@@ -49,23 +142,54 @@ impl ReservationOutcome {
         }
     }
 
-    /// `status:code`, with an empty code when no HTTP response was received.
+    /// `status:code`, with an empty code when no HTTP response was received, and
+    /// `:issued_at:signature` appended when a receipt was signed for this charge.
     /// Paired with `from_marker` so the two halves cannot drift apart.
-    fn marker_value(&self) -> String {
-        match self.upstream_status() {
+    ///
+    /// The receipt rides inside the marker rather than in a key of its own because the
+    /// marker's whole purpose is to carry what the drain must apply when the row did not
+    /// exist yet, and a receipt is exactly that. One key means one write and no new
+    /// ordering invariant between two keys that could be read half-applied.
+    fn marker_value(&self, receipt: Option<(u64, &[u8])>) -> String {
+        let outcome = match self.upstream_status() {
             Some(code) => format!("{}:{code}", self.status_str()),
             None => format!("{}:", self.status_str()),
+        };
+        match receipt {
+            Some((issued_at, signature)) => {
+                format!(
+                    "{outcome}:{issued_at}:{}",
+                    alloy::hex::encode_prefixed(signature)
+                )
+            }
+            None => outcome,
         }
     }
 
-    fn from_marker(marker: &str) -> Option<Self> {
-        let (status, code) = marker.split_once(':')?;
-        let upstream_status = code.parse::<i32>().ok();
-        match status {
-            "queued" => upstream_status.map(|upstream_status| ReservationOutcome::Queued { upstream_status }),
-            "voided" => Some(ReservationOutcome::Voided { upstream_status }),
+    fn from_marker(marker: &str) -> Option<(Self, Option<StoredReceipt>)> {
+        let mut parts = marker.splitn(4, ':');
+        let status = parts.next()?;
+        let upstream_status = parts.next()?.parse::<i32>().ok();
+
+        let outcome = match status {
+            "queued" => ReservationOutcome::Queued {
+                upstream_status: upstream_status?,
+            },
+            "voided" => ReservationOutcome::Voided { upstream_status },
+            _ => return None,
+        };
+
+        // A marker written before Task 7.1, or for a void, carries no receipt. That is not a
+        // parse failure: the outcome half must still be applied.
+        let receipt = match (parts.next(), parts.next()) {
+            (Some(issued_at), Some(signature)) => Some((
+                issued_at.parse::<u64>().ok()?,
+                alloy::hex::decode(signature).ok()?,
+            )),
             _ => None,
-        }
+        };
+
+        Some((outcome, receipt))
     }
 }
 
@@ -85,10 +209,11 @@ pub async fn mark_outcome(
     redis: &mut ConnectionManager,
     nonce_hex: &str,
     outcome: &ReservationOutcome,
+    receipt: Option<(u64, &[u8])>,
 ) -> redis::RedisResult<()> {
     redis::cmd("SET")
         .arg(outcome_marker_key(nonce_hex))
-        .arg(outcome.marker_value())
+        .arg(outcome.marker_value(receipt))
         .arg("EX")
         .arg(OUTCOME_MARKER_TTL_SECS)
         .query_async(redis)
@@ -101,18 +226,28 @@ pub async fn mark_outcome(
 /// one-way (`reserved -> queued` or `reserved -> voided` only) and makes a
 /// racing `mark_outcome` + drain insert safe: whichever of this UPDATE and
 /// the drain's INSERT runs second is a no-op against the other's result.
+/// `receipt` is `Some` only for a promotion (Task 7.1 signs at 2xx and nowhere else), and
+/// `COALESCE` keeps it that way: whichever of the two promotion paths runs second cannot
+/// blank a signature the first already stored.
 pub async fn apply_outcome_update(
     pg: &PgPool,
     nonce: &[u8],
     outcome: &ReservationOutcome,
+    receipt: Option<(u64, &[u8])>,
 ) -> Result<u64, sqlx::Error> {
     let result = sqlx::query(
-        "UPDATE authorisations SET status = $1, upstream_status = $2
+        "UPDATE authorisations
+            SET status = $1,
+                upstream_status = $2,
+                receipt_sig = COALESCE($4, receipt_sig),
+                receipt_issued_at = COALESCE($5, receipt_issued_at)
          WHERE nonce = $3 AND status = 'reserved'",
     )
     .bind(outcome.status_str())
     .bind(outcome.upstream_status())
     .bind(nonce)
+    .bind(receipt.map(|(_, signature)| signature))
+    .bind(receipt.map(|(issued_at, _)| issued_at as i64))
     .execute(pg)
     .await?;
     Ok(result.rows_affected())
@@ -502,15 +637,109 @@ async fn insert_reservation(
         .await
         .map_err(|e| format!("failed to read outcome marker: {e}"))?;
 
-    if let Some(outcome) = marker.as_deref().and_then(ReservationOutcome::from_marker) {
+    if let Some((outcome, receipt)) = marker.as_deref().and_then(ReservationOutcome::from_marker) {
         // `WHERE status = 'reserved'` inside makes this idempotent against the
-        // request path having already applied the same transition.
-        apply_outcome_update(pg, nonce.as_slice(), &outcome)
+        // request path having already applied the same transition. The receipt
+        // comes along for the ride: this is the branch where the request path's
+        // own UPDATE found no row, so it is the only chance to persist the
+        // signature it already handed to the caller in a response header.
+        let receipt = receipt
+            .as_ref()
+            .map(|(issued_at, signature)| (*issued_at, signature.as_slice()));
+        apply_outcome_update(pg, nonce.as_slice(), &outcome, receipt)
             .await
             .map_err(|e| format!("failed to apply outcome marker: {e}"))?;
     }
 
     Ok(())
+}
+
+/// What `GET /v1/receipts/{nonce}` found. A charge with no receipt is a different answer from
+/// a nonce this gateway has never seen, and the caller deserves to be told which.
+pub enum ReceiptLookup {
+    UnknownNonce,
+    /// The charge exists but was never promoted, so no receipt was ever signed: it was voided
+    /// on an upstream failure, or it is still in flight.
+    NotIssued { status: String },
+    Issued {
+        receipt: SignedReceipt,
+        /// Populated by the settler once the batch lands (Task 6.4), NULL until then.
+        tx_hash: Option<B256>,
+    },
+}
+
+#[derive(sqlx::FromRow)]
+struct ReceiptRow {
+    payer: Vec<u8>,
+    capability_hash: Option<Vec<u8>>,
+    provider_slug: Option<String>,
+    amount_wei: String,
+    upstream_status: Option<i32>,
+    receipt_issued_at: Option<i64>,
+    receipt_sig: Option<Vec<u8>>,
+    tx_hash: Option<Vec<u8>>,
+    status: String,
+}
+
+/// Rebuilds the exact `Receipt` that was signed, from the row's own columns.
+///
+/// Every field is read back from where the signing path wrote it — including
+/// `capability_hash`, whose SQL NULL becomes the `0x0` that was signed for a payer-level
+/// charge. A field reconstructed even slightly differently would produce a body the stored
+/// signature does not cover, so this function and `handle_proxy_request`'s call to
+/// `sign_receipt` are two halves of one contract.
+pub async fn fetch_receipt(pg: &PgPool, nonce: B256) -> Result<ReceiptLookup, String> {
+    let row: Option<ReceiptRow> = sqlx::query_as(
+        "SELECT payer, capability_hash, provider_slug, amount_wei::TEXT AS amount_wei,
+                upstream_status, receipt_issued_at, receipt_sig, tx_hash, status
+         FROM authorisations WHERE nonce = $1",
+    )
+    .bind(nonce.as_slice())
+    .fetch_optional(pg)
+    .await
+    .map_err(|e| format!("receipt lookup failed: {e}"))?;
+
+    let Some(row) = row else {
+        return Ok(ReceiptLookup::UnknownNonce);
+    };
+
+    let (Some(signature), Some(issued_at)) = (row.receipt_sig, row.receipt_issued_at) else {
+        return Ok(ReceiptLookup::NotIssued { status: row.status });
+    };
+
+    let upstream_status = row
+        .upstream_status
+        .and_then(|code| u16::try_from(code).ok())
+        .ok_or_else(|| "a signed receipt must have an upstream status".to_string())?;
+
+    let receipt = Receipt {
+        nonce,
+        payer: bytea_to_address(&row.payer).map_err(|e| e.to_string())?,
+        capabilityHash: row
+            .capability_hash
+            .as_deref()
+            .map(bytea_to_b256)
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .unwrap_or(B256::ZERO),
+        providerSlug: row.provider_slug.unwrap_or_default(),
+        amount: numeric_to_u256(&row.amount_wei).map_err(|e| e.to_string())?,
+        upstreamStatus: upstream_status,
+        timestamp: issued_at as u64,
+    };
+
+    Ok(ReceiptLookup::Issued {
+        receipt: SignedReceipt {
+            receipt,
+            signature,
+        },
+        tx_hash: row
+            .tx_hash
+            .as_deref()
+            .map(bytea_to_b256)
+            .transpose()
+            .map_err(|e| e.to_string())?,
+    })
 }
 
 #[cfg(test)]
@@ -624,11 +853,11 @@ mod outcome_race {
         let outcome = ReservationOutcome::Voided {
             upstream_status: Some(500),
         };
-        mark_outcome(&mut redis, &nonce_hex, &outcome)
+        mark_outcome(&mut redis, &nonce_hex, &outcome, None)
             .await
             .expect("marking the outcome should succeed");
         let nonce = B256::from_str(&nonce_hex).unwrap();
-        let rows = apply_outcome_update(&pg, nonce.as_slice(), &outcome)
+        let rows = apply_outcome_update(&pg, nonce.as_slice(), &outcome, None)
             .await
             .expect("the update should not error");
         assert_eq!(rows, 0, "no row exists yet, so this UPDATE must match nothing");
@@ -670,9 +899,11 @@ mod outcome_race {
         let outcome = ReservationOutcome::Queued {
             upstream_status: 200,
         };
-        mark_outcome(&mut redis, &nonce_hex, &outcome).await.unwrap();
+        mark_outcome(&mut redis, &nonce_hex, &outcome, None)
+            .await
+            .unwrap();
         let nonce = B256::from_str(&nonce_hex).unwrap();
-        let rows = apply_outcome_update(&pg, nonce.as_slice(), &outcome)
+        let rows = apply_outcome_update(&pg, nonce.as_slice(), &outcome, None)
             .await
             .expect("the update should not error");
 
@@ -704,6 +935,7 @@ mod outcome_race {
             &ReservationOutcome::Queued {
                 upstream_status: 200,
             },
+            None,
         )
         .await
         .unwrap();
@@ -714,6 +946,7 @@ mod outcome_race {
             &ReservationOutcome::Voided {
                 upstream_status: Some(500),
             },
+            None,
         )
         .await
         .unwrap();
@@ -727,6 +960,107 @@ mod outcome_race {
             Some(("queued".to_string(), Some(200))),
             "the first outcome stands"
         );
+    }
+}
+
+/// A receipt is only worth anything if a third party who has never seen this gateway's
+/// database can check it: recover the signer from the body and compare it against the address
+/// published at `GET /v1/gateway-key`. These tests are that check, done in-process.
+#[cfg(test)]
+mod receipt_signature {
+    use super::*;
+    use alloy::primitives::U256;
+
+    const CHAIN_ID: u64 = 84532;
+
+    fn signer() -> PrivateKeySigner {
+        PrivateKeySigner::from_bytes(&B256::from([0x11; 32]))
+            .expect("a fixed non-zero scalar is a valid signing key")
+    }
+
+    fn receipt() -> Receipt {
+        Receipt {
+            nonce: B256::from([0xcd; 32]),
+            payer: Address::from([0xa1; 20]),
+            capabilityHash: B256::from([0x77; 32]),
+            providerSlug: "mock-ok".to_string(),
+            amount: U256::from(1000u64),
+            upstreamStatus: 200,
+            timestamp: 1_786_200_000,
+        }
+    }
+
+    /// Recovers the address `GET /v1/gateway-key` publishes, which is what makes the receipt
+    /// verifiable by someone who trusts nothing here.
+    fn recovered(signed: &SignedReceipt) -> Address {
+        let hash = signed
+            .receipt
+            .eip712_signing_hash(&crate::capability::domain(CHAIN_ID));
+        alloy::primitives::Signature::from_raw(&signed.signature)
+            .expect("a signature this module produced should parse")
+            .recover_address_from_prehash(&hash)
+            .expect("recovery should succeed")
+    }
+
+    #[test]
+    fn recovering_the_signature_yields_the_gateway_signing_address() {
+        let signer = signer();
+        let signed = sign_receipt(&signer, CHAIN_ID, receipt()).expect("signing should succeed");
+
+        assert_eq!(recovered(&signed), signer.address());
+    }
+
+    /// The tamper check. Changing the amount after signing must break verification — if it did
+    /// not, a receipt would prove nothing about what was actually charged.
+    #[test]
+    fn altering_the_amount_breaks_verification() {
+        let signer = signer();
+        let mut signed = sign_receipt(&signer, CHAIN_ID, receipt()).expect("signing should succeed");
+
+        signed.receipt.amount += U256::from(1u64);
+
+        assert_ne!(
+            recovered(&signed),
+            signer.address(),
+            "a tampered amount must not recover to the gateway's address"
+        );
+    }
+
+    /// The receipt reaches Postgres inside the outcome marker whenever the drain has not
+    /// inserted the row yet, so the marker's encoding has to survive a round trip intact — a
+    /// truncated signature here would be a receipt the caller holds and the ledger does not.
+    #[test]
+    fn a_receipt_round_trips_through_the_outcome_marker() {
+        let signer = signer();
+        let signed = sign_receipt(&signer, CHAIN_ID, receipt()).expect("signing should succeed");
+        let outcome = ReservationOutcome::Queued {
+            upstream_status: 200,
+        };
+
+        let (parsed_outcome, parsed_receipt) =
+            ReservationOutcome::from_marker(&outcome.marker_value(Some(signed.stored())))
+                .expect("the marker should parse");
+
+        assert_eq!(parsed_outcome, outcome);
+        assert_eq!(
+            parsed_receipt,
+            Some((signed.receipt.timestamp, signed.signature.clone()))
+        );
+    }
+
+    /// A void signs no receipt, and a marker from before Task 7.1 carries none. Both must
+    /// still apply their outcome rather than failing to parse.
+    #[test]
+    fn a_marker_without_a_receipt_still_parses() {
+        let outcome = ReservationOutcome::Voided {
+            upstream_status: Some(500),
+        };
+        let (parsed_outcome, parsed_receipt) =
+            ReservationOutcome::from_marker(&outcome.marker_value(None))
+                .expect("the marker should parse");
+
+        assert_eq!(parsed_outcome, outcome);
+        assert_eq!(parsed_receipt, None);
     }
 }
 

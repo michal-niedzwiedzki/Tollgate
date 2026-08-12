@@ -9,6 +9,7 @@ pub mod budgets;
 pub mod capabilities;
 pub mod providers;
 pub mod proxy;
+pub mod receipts;
 
 pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     let postgres_ok = sqlx::query("SELECT 1").execute(&state.pg).await.is_ok();

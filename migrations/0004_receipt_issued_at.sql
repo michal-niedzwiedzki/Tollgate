@@ -1,0 +1,14 @@
+-- Task 7.1 signs an EIP-712 `Receipt` per charge and stores the signature in `receipt_sig`
+-- (0001). `GET /v1/receipts/{nonce}` then has to hand a caller back the *body* that signature
+-- covers, so every signed field must be reconstructible from this row: `nonce` is the primary
+-- key, `payer`, `capability_hash`, `provider_slug`, `amount_wei` and `upstream_status` are all
+-- columns already — and `timestamp` is the one field with nowhere to live.
+--
+-- Without it the endpoint could only return a signature over a body it cannot reproduce, which
+-- is not a receipt at all: the whole point of prd.md F6 is an artifact a third party can verify
+-- without trusting this gateway's database.
+--
+-- BIGINT rather than TIMESTAMPTZ deliberately. The signed field is a `uint64` of unix seconds,
+-- and storing it as the integer that was actually signed removes any question of a timezone or
+-- sub-second round-trip changing the value between signing and verification.
+ALTER TABLE authorisations ADD COLUMN receipt_issued_at BIGINT;

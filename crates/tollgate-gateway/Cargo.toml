@@ -17,7 +17,7 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 base64 = { workspace = true }
 url = { workspace = true }
-alloy = { workspace = true, default-features = false, features = ["std", "sol-types", "eip712", "k256"] }
+alloy = { workspace = true, default-features = false, features = ["std", "sol-types", "eip712", "k256", "signer-local"] }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 tower = { workspace = true }

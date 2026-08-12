@@ -176,6 +176,60 @@ gave the 402 body the same `tripped_level`, `capability_hash` and per-level `cha
 carries. Observed under real concurrency: workers 1 and 3 succeed 6/6, worker 2 succeeds exactly
 twice against its 0.10 cap and is then refused with `tripped_level: 1`, its own capability.
 
+### Phase 7 — receipts and expense report
+
+Settled 2026-08-12, before Task 7.1, from a read of `plan.md` §Phase 7 and the Phase 0–6 code as
+built. Both are things Task 7.1's Implementation section leaves open that its own Verification
+block then depends on.
+
+**D12. `receipt_issued_at` is a fourth migration, because a receipt must be reproducible from
+its row.**
+
+Task 7.1 says to store the signature in `authorisations.receipt_sig` and to serve
+`GET /v1/receipts/{nonce}`. Those two only compose if the endpoint can hand back the exact body
+the signature covers — a signature over a body the server cannot reproduce is not a receipt,
+and `prd.md` F6 is specifically about an artifact a third party can check without trusting this
+gateway.
+
+Every other signed field is already a column: `nonce` is the primary key, and `payer`,
+`capability_hash`, `provider_slug`, `amount_wei` and `upstream_status` all exist from 0001.
+`timestamp` is the only one with nowhere to live, so `migrations/0004_receipt_issued_at.sql`
+adds it. `BIGINT`, not `TIMESTAMPTZ`: the signed field is a `uint64` of unix seconds and
+storing the integer that was actually signed removes any chance of a timezone or sub-second
+round trip changing the value between signing and verification.
+
+**D13. `capabilityHash` is `0x0` for a payer-level charge, mirroring the column exactly.**
+
+Under D1 the no-capability path is permanent, and under D5 those rows carry
+`capability_hash IS NULL` while the leaf lives there for delegated charges. The receipt field is
+a `bytes32` with no null, so the two candidates were `0x0` and the synthetic
+`policy::payer_cap_hash(payer)` that `chain_hashes` records.
+
+`0x0` wins for one reason: D12 requires the row to reproduce the signed body byte-for-byte, and
+`capability_hash` is what the row has. Signing the synthetic hash would mean signing a value the
+row does not store, so `fetch_receipt` could not rebuild it. `0x0` also reads correctly — this
+charge drew on no capability — whereas the payer hash would name a `capabilities` row that does
+not exist.
+
+The consequence to know: `routes/proxy.rs`'s `sign_charge_receipt` and `ledger::fetch_receipt`
+are two halves of one contract. A field encoded differently in either one produces a receipt
+that fails to verify, so they change together or not at all.
+
+**D14. The receipt rides inside the outcome marker, because promotion has two paths.**
+
+Task 7.1 says "sign at promotion time" as though promotion happened once. It happens in two
+places (Task 4.4): the request path's own `apply_outcome_update`, and the drain applying the
+`tg:outcome:{nonce}` marker for the case where that UPDATE ran before the row existed. A receipt
+written only by the first path would be silently lost whenever the second one is the live one —
+the caller would hold a receipt in its response header that the ledger never recorded.
+
+So `marker_value`/`from_marker` gained an optional `:issued_at:signature` suffix and both
+`mark_outcome` and `apply_outcome_update` take the receipt. One key rather than a second
+`tg:receipt:{nonce}` key: the marker already exists to carry exactly this kind of
+decided-but-not-yet-writable state, and one key means one write and no new ordering invariant
+between two keys that could be observed half-applied. `COALESCE` in the UPDATE means whichever
+path runs second cannot blank what the first stored.
+
 ---
 
 ## Fixed

@@ -24,12 +24,59 @@ use crate::x402::validate::validate_fields;
 
 const X_PAYMENT: HeaderName = HeaderName::from_static("x-payment");
 const X_TOLLGATE_CAPABILITY: HeaderName = HeaderName::from_static("x-tollgate-capability");
+const X_TOLLGATE_RECEIPT: HeaderName = HeaderName::from_static("x-tollgate-receipt");
+
+/// Signs the receipt for a charge whose upstream returned 2xx (Task 7.1).
+///
+/// Returns `None` on a signing failure and logs it, rather than failing the request: the caller
+/// has already received the upstream data it paid for, and withholding a 200 over a missing
+/// attestation would turn a signing problem into a charge for nothing.
+#[allow(clippy::too_many_arguments)]
+fn sign_charge_receipt(
+    state: &AppState,
+    nonce: alloy::primitives::B256,
+    payer: alloy::primitives::Address,
+    capability_leaf: Option<alloy::primitives::B256>,
+    provider_slug: &str,
+    amount: alloy::primitives::U256,
+    upstream_status: u16,
+) -> Option<ledger::SignedReceipt> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after the unix epoch")
+        .as_secs();
+
+    let receipt = ledger::Receipt {
+        nonce,
+        payer,
+        // `0x0` for the payer-level path, mirroring the SQL NULL the same charge writes to
+        // `authorisations.capability_hash`, so the row can reproduce this exact body later.
+        capabilityHash: capability_leaf.unwrap_or(alloy::primitives::B256::ZERO),
+        providerSlug: provider_slug.to_string(),
+        amount,
+        upstreamStatus: upstream_status,
+        timestamp,
+    };
+
+    match ledger::sign_receipt(&state.receipt_signer, state.cfg.chain_id, receipt) {
+        Ok(signed) => Some(signed),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to sign the charge receipt");
+            None
+        }
+    }
+}
 
 /// The capability levels a request charges against, root first, plus the subject of each so
 /// the 429 body can say who owns the budget that said no.
 struct Levels {
     levels: Vec<CapLevel>,
     subjects: Vec<String>,
+    /// The leaf capability's hash — "which agent spent this" (NOTES.md D5) — or `None` for the
+    /// payer-level path, which has no capability at all. This is what the receipt signs as
+    /// `capabilityHash`, and it must track `authorisations.capability_hash` exactly: the leaf
+    /// there, SQL NULL here, `0x0` in the signed body.
+    capability_leaf: Option<alloy::primitives::B256>,
 }
 
 impl Levels {
@@ -62,6 +109,9 @@ async fn resolve_levels(
                 cap_hash: policy::payer_cap_hash(&payer),
             }],
             subjects: vec![payer.to_string()],
+            // The payer-level hash is a synthetic key, not a capability: no row exists for it
+            // in `capabilities`, so the receipt records no capability either.
+            capability_leaf: None,
         });
     };
 
@@ -194,7 +244,17 @@ async fn resolve_levels(
         .map(|link| link.capability.subject.to_string())
         .collect();
 
-    Ok(Levels { levels, subjects })
+    // The leaf, which `decode_capability_chain` guarantees exists — an empty chain is rejected
+    // there. D6 has already persisted its row above, so this hash is a real `capabilities` key.
+    let capability_leaf = chain
+        .last()
+        .map(|link| capability::struct_hash(&link.capability));
+
+    Ok(Levels {
+        levels,
+        subjects,
+        capability_leaf,
+    })
 }
 
 /// Per-level budget state for the 429 body. architecture.md §4.3: "The 429 body is worth
@@ -385,10 +445,27 @@ pub async fn handle_proxy_request(
             // (Task 4.3's redirect decision extended to the rest of the non-2xx
             // range); only a 5xx becomes a 502, since the upstream's own error
             // detail is not this gateway's to leak verbatim.
-            let (outcome, response) = match proxy_result {
+            let (outcome, mut response, receipt) = match proxy_result {
                 Ok(resp) if resp.status().is_success() => {
                     let code = i32::from(resp.status().as_u16());
-                    (ledger::ReservationOutcome::Queued { upstream_status: code }, resp)
+                    // Task 7.1: sign at promotion, and only at promotion. A receipt asserts
+                    // the upstream delivered, so a voided charge has nothing to attest to.
+                    let receipt = sign_charge_receipt(
+                        &state,
+                        auth.nonce,
+                        payer,
+                        levels.capability_leaf,
+                        &provider.slug,
+                        auth.value,
+                        resp.status().as_u16(),
+                    );
+                    (
+                        ledger::ReservationOutcome::Queued {
+                            upstream_status: code,
+                        },
+                        resp,
+                        receipt,
+                    )
                 }
                 Ok(resp) if resp.status().is_server_error() => {
                     let code = i32::from(resp.status().as_u16());
@@ -403,33 +480,55 @@ pub async fn handle_proxy_request(
                         )),
                     )
                         .into_response();
-                    (outcome, response)
+                    (outcome, response, None)
                 }
                 Ok(resp) => {
                     let code = i32::from(resp.status().as_u16());
                     let outcome = ledger::ReservationOutcome::Voided {
                         upstream_status: Some(code),
                     };
-                    (outcome, resp)
+                    (outcome, resp, None)
                 }
                 Err(err) => {
                     let outcome = ledger::ReservationOutcome::Voided {
                         upstream_status: None,
                     };
                     let response = proxy::proxy_error_response(err);
-                    (outcome, response)
+                    (outcome, response, None)
                 }
             };
+
+            // In the same round trip, per Task 7.1: the caller holds its receipt before the
+            // ledger write has even been drained.
+            if let Some(receipt) = &receipt {
+                match axum::http::HeaderValue::from_str(&receipt.to_header_value()) {
+                    Ok(value) => {
+                        response.headers_mut().insert(X_TOLLGATE_RECEIPT, value);
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, "receipt header value was not valid ascii")
+                    }
+                }
+            }
+            let stored_receipt = receipt.as_ref().map(ledger::SignedReceipt::stored);
 
             let mut redis = state.redis.clone();
             // Marker first, then the direct UPDATE — this order must not be
             // swapped. The drain relies on it: it reads the marker after its
             // own INSERT, so a marker written before this UPDATE is guaranteed
             // visible to the drain whenever this UPDATE finds no row yet.
-            if let Err(err) = ledger::mark_outcome(&mut redis, &nonce_hex, &outcome).await {
+            if let Err(err) =
+                ledger::mark_outcome(&mut redis, &nonce_hex, &outcome, stored_receipt).await
+            {
                 tracing::error!(error = %err, "failed to write outcome marker");
             }
-            if let Err(err) = ledger::apply_outcome_update(&state.pg, auth.nonce.as_slice(), &outcome).await
+            if let Err(err) = ledger::apply_outcome_update(
+                &state.pg,
+                auth.nonce.as_slice(),
+                &outcome,
+                stored_receipt,
+            )
+            .await
             {
                 tracing::error!(error = %err, "failed to apply reservation outcome update");
             }
