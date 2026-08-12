@@ -135,6 +135,7 @@ async fn main() -> Result<()> {
                             &pool,
                             &outcome.settled,
                             outcome.tx_hash.as_slice(),
+                            i64::try_from(outcome.gas_used).ok(),
                         )
                         .await?;
 
@@ -188,10 +189,13 @@ async fn main() -> Result<()> {
 
                         match chain::classify_ambiguous(&settler, &claimed.items).await {
                             Ok(verdict) => {
+                                // No receipt was ever seen on this path — the charge is confirmed
+                                // by `authorizationState` on-chain — so there is no gas figure.
                                 let updated = batch::mark_settled(
                                     &pool,
                                     &verdict.settled,
                                     tx_hash.as_slice(),
+                                    None,
                                 )
                                 .await?;
                                 info!(

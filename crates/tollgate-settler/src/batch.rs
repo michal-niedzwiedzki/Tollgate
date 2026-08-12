@@ -93,18 +93,29 @@ pub async fn claim_batch(pool: &PgPool, limit: i64) -> Result<Option<Batch>> {
 ///
 /// `WHERE status = 'queued'` keeps the transition one-way, the same guard the gateway's promotion
 /// path uses.
-pub async fn mark_settled(pool: &PgPool, nonces: &[Vec<u8>], tx_hash: &[u8]) -> Result<u64> {
+///
+/// `gas_used` is the whole transaction's gas, repeated across every row of its batch, which is
+/// what lets `/v1/stats` divide it by the batch to get gas per charge (Task 7.3). `None` when no
+/// receipt was seen — the ambiguous-timeout path confirms a charge through `authorizationState`
+/// rather than through a receipt, so there is no gas figure to record and NULL says so.
+pub async fn mark_settled(
+    pool: &PgPool,
+    nonces: &[Vec<u8>],
+    tx_hash: &[u8],
+    gas_used: Option<i64>,
+) -> Result<u64> {
     if nonces.is_empty() {
         return Ok(0);
     }
 
     let result = sqlx::query(
         "UPDATE authorisations
-            SET status = 'settled', settled_at = now(), tx_hash = $1
+            SET status = 'settled', settled_at = now(), tx_hash = $1, gas_used = $3
           WHERE nonce = ANY($2) AND status = 'queued'",
     )
     .bind(tx_hash)
     .bind(nonces)
+    .bind(gas_used)
     .execute(pool)
     .await
     .context("mark settled")?;

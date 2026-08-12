@@ -1,0 +1,14 @@
+-- Task 7.3's `/v1/stats` reports gas per batch and gas per charge, and the Phase 7 Gate checks
+-- the latter against the `forge snapshot` figure. Nothing recorded gas before this: the settler
+-- had the receipt in hand but `SettlementOutcome` kept only `tx_hash`, and the gateway is a
+-- separate process that cannot see the settler's memory at all.
+--
+-- Stamped per row rather than in a batches table: `batch_id` already groups the rows of one
+-- submission, so `gas_used` is the transaction's total repeated across its own batch, and
+-- gas-per-charge is that value divided by the rows sharing the id. One column, no new table, and
+-- it survives the settler being restarted mid-run.
+--
+-- NULL means "not known", which is the honest answer for two cases: rows settled before this
+-- migration, and rows resolved through the ambiguous-timeout path, where the charge is confirmed
+-- by `authorizationState` on-chain and no receipt was ever seen.
+ALTER TABLE authorisations ADD COLUMN gas_used BIGINT;

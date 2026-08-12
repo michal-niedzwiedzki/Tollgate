@@ -294,6 +294,7 @@ pub async fn handle_proxy_request(
     body: axum::body::Body,
 ) -> axum::response::Response {
     let _total_timer = StageTimer::start("total");
+    let request_started = std::time::Instant::now();
 
     let provider = match db::get_provider(&state.pg, &provider_slug).await {
         Ok(Some(provider)) => provider,
@@ -437,7 +438,13 @@ pub async fn handle_proxy_request(
                 body,
                 client_addr: Some(client_addr),
             };
+            let upstream_started = std::time::Instant::now();
             let proxy_result = proxy::proxy_request(&state.proxy_client, &provider, inbound).await;
+            // architecture.md §11 and prd.md §8: the upstream hop is "reported separately and
+            // never folded into your number". `total` folds it in by construction, so the
+            // gateway's own added latency has to be measured as its complement — otherwise
+            // `/v1/stats` would have no honest `gateway_p50` to report (Task 7.3).
+            let upstream_elapsed = upstream_started.elapsed();
 
             // architecture.md §4.2 step 7 / §4.3: a 2xx promotes the reservation to
             // settleable; anything else voids it and credits the budget back. A
@@ -540,6 +547,14 @@ pub async fn handle_proxy_request(
             {
                 tracing::error!(error = %err, "failed to credit budget back after void");
             }
+
+            // Everything this handler did except wait on the upstream: decode, recovery, the
+            // chain walk, the claim, promotion and receipt signing. This is the number
+            // `prd.md` §8 puts a 15 ms p50 budget on, and the one `/v1/stats` reports as
+            // `gateway_p50`. Recorded only on the path that actually reached an upstream —
+            // a 402 or 409 refusal never pays for one, so folding those in would flatter it.
+            metrics::histogram!("tollgate_stage_seconds", "stage" => "gateway")
+                .record(request_started.elapsed().saturating_sub(upstream_elapsed).as_secs_f64());
 
             response
         }

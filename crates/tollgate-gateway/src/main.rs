@@ -100,6 +100,8 @@ async fn main() -> anyhow::Result<()> {
             get(routes::expense::expense_report),
         )
         .route("/v1/gateway-key", get(routes::receipts::gateway_key))
+        .route("/v1/feed", get(routes::feed::feed))
+        .route("/v1/stats", get(routes::feed::stats))
         .route(
             "/v1/proxy/{provider_slug}/{*path}",
             any(routes::proxy::handle_proxy_request),

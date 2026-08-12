@@ -348,6 +348,8 @@ is `403 not_authorised_to_revoke`. Revocations may not be future-dated.
 | `GET` | `/v1/receipts/{nonce}` | Signed receipt for a charge, plus `tx_hash` once settled; `404 receipt_not_issued` if the charge was voided or is still in flight |
 | `GET` | `/v1/expense-report` | `?capability=0x…` for a delegation subtree, or `?payer=0x…` for a payer-level budget. Signed; see below |
 | `GET` | `/v1/gateway-key` | The address that signs receipts and expense reports, and the EIP-712 domain to verify them under |
+| `GET` | `/v1/feed` | `?limit=50&since=<ISO timestamp>` — recent charges, newest first, payer address in full |
+| `GET` | `/v1/stats` | Live panel: gateway and upstream latency percentiles, batch size, gas per batch and per charge, queue depth, mean queued→settled |
 | `ANY` | `/v1/proxy/{slug}/{*path}` | The paid path |
 
 Every error uses one shared body, defined once in `tollgate-core/src/error.rs`:
@@ -543,15 +545,23 @@ Per-stage Prometheus histograms named `tollgate_stage_seconds`, with a `stage` l
 | `capability` | the chain walk, including the revocation lookup |
 | `claim` | the Lua round-trip |
 | `upstream` | the proxy hop |
-| `total` | the whole request |
+| `gateway` | the whole request **minus** the upstream hop — the added latency `prd.md` §8 budgets |
+| `total` | the whole request, upstream included |
 
 ```bash
 curl -s localhost:8080/metrics | grep tollgate_stage_seconds
+curl -s localhost:8080/v1/stats                  # the same numbers, as percentiles
 ```
 
 `upstream` is recorded separately and never folded into the others — `prd.md` §8 targets p50 under
-15 ms of *added gateway* latency, and conflating the two would make the number meaningless. Per
-`plan.md` A8 no phase gate is conditioned on hitting the target; missing it is a tuning problem.
+15 ms of *added gateway* latency, and conflating the two would make the number meaningless. That
+is why `gateway` exists alongside `total`: `total` spans the whole handler and necessarily includes
+the upstream, so it is not the number to quote. `gateway` is recorded only on requests that
+actually reached an upstream, since a 402 or 409 refusal never pays for one. Per `plan.md` A8 no
+phase gate is conditioned on hitting the target; missing it is a tuning problem.
+
+`GET /v1/stats` serves these as percentiles by parsing the same exported histograms, so it and
+`/metrics` agree by construction. A stage with no observations yet reads as `null`, not zero.
 
 ---
 

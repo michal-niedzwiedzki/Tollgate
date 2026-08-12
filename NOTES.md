@@ -279,6 +279,61 @@ Two consequences worth stating:
   decrements every level of its chain (architecture.md §5.2), so a supervisor's counter is
   already the whole subtree's total. Summing children here would double-count.
 
+**D17. The settler records gas, because nothing else can.**
+
+Settled 2026-08-12, before Task 7.3, **by the human** — it was raised as a blocking question
+rather than decided unilaterally, because the fix necessarily reaches outside the task's stated
+scope.
+
+Task 7.3's `/v1/stats` reports gas per batch and gas per charge, and the Phase 7 Gate checks the
+latter against `.gas-snapshot`. No gas figure existed anywhere: `chain::submit` had the receipt
+in hand and kept only `tx_hash`, no column stored it, and the gateway is a separate process that
+cannot read the settler's memory. Task 7.3's Implementation section names only two gateway
+endpoints and never says where gas comes from.
+
+Chosen: `migrations/0005_gas_used.sql` adds `gas_used BIGINT`, `SettlementOutcome` carries
+`receipt.gas_used`, and `mark_settled` stamps it across the batch's rows. The alternative —
+having the gateway fetch receipts over RPC when `/v1/stats` is called — was rejected: it needs
+alloy provider dependencies in the gateway, puts network I/O on a read endpoint, and yields null
+whenever the RPC is unreachable.
+
+`gas_used` is NULL for rows settled through the ambiguous-timeout path, where the charge is
+confirmed by `authorizationState` and no receipt is ever seen, and for rows settled before this
+migration. NULL means "not known", never zero.
+
+`gas_per_charge` divides the transaction's whole gas by the charges that **settled** in it.
+Items the contract refused burned gas too and are not in that denominator, so the figure reads
+slightly high — the conservative direction for a cost claim.
+
+**D18. `total` is not the gateway's latency, so Task 7.3 needed a `gateway` stage.**
+
+`prd.md` §8 budgets *added gateway latency* at 15 ms p50 and architecture.md §11 says the
+upstream hop is "reported separately and never folded into your number". The `total` histogram
+from Task 2.5 folds it in by construction — the RAII timer spans the whole handler, upstream
+included — so there was no honest `gateway_p50` to report.
+
+Reporting `total` under the name `gateway_p50` would have been precisely the conflation
+`prd.md` §8 warns about, and summing the per-stage quantiles instead is not valid either
+(quantile-of-sum ≠ sum-of-quantiles). So the proxy handler now records a `gateway` stage:
+elapsed request time minus the measured upstream hop, a real per-request value.
+
+Recorded only on the path that actually reached an upstream. A 402 or 409 refusal never pays for
+one, and folding those cheap requests in would flatter the number.
+
+**D19. Percentiles are parsed out of the metrics the gateway already exports.**
+
+`PrometheusHandle` exposes no structured snapshot — `render()` is the entire public API — so
+`/v1/stats` parses its own exported histogram buckets and interpolates, standard
+`histogram_quantile` semantics. This is deliberate rather than merely expedient: `/v1/stats` and
+`/metrics` are then the same numbers by construction, with no second copy of the latency data to
+keep in step. An unobserved stage returns JSON null, never a fabricated zero.
+
+`GET /v1/feed`'s `since` cursor is an ISO-8601 timestamp and returns strictly newer rows, so the
+row that produced the cursor is not redelivered. `created_at` ties are theoretically possible at
+microsecond resolution and would drop a row; a monotonic cursor is the fix if that ever matters.
+`voided` charges are excluded, as everywhere else, and `status` is included so a reader can tell
+a settled charge from a queued one without inferring it from `tx_hash` being null.
+
 ---
 
 ## Fixed
@@ -482,6 +537,41 @@ browser access to the faucets can obtain. It is not blocked on anything in the c
    `version` "2", and `authorizationState` present.
 6. Run 10 paid requests through the gateway, then the settler once, and work through the Task 6.6
    verification block. Replace the README's fork-derived cost figures with the measured ones.
+
+### `cargo build --workspace` produces a gateway binary that panics at startup
+
+**Found:** 2026-08-12, during Task 7.3 verification, by building both binaries in one command.
+
+The gateway asks for `hyper-rustls` with `ring`; the settler pulls `alloy`'s
+`reqwest-rustls-tls`, which turns on `hyper-rustls`'s `aws-lc-rs`. Cargo unifies features per
+dependency across a single invocation, so building both packages together links a gateway whose
+rustls has **two** crypto providers and therefore no default. It then panics on the first TLS
+setup:
+
+```
+Could not automatically determine the process-level CryptoProvider from Rustls crate features.
+Call CryptoProvider::install_default() before this point to select a provider manually, or make
+sure exactly one of the 'aws-lc-rs' and 'ring' features is enabled.
+```
+
+Confirmed with `cargo tree -e features -i rustls`, which shows `hyper-rustls feature "aws-lc-rs"`
+arriving via `reqwest → alloy-transport-http → alloy feature "reqwest-rustls-tls"`.
+
+**Not introduced by Phase 7.** The gateway's `hyper-rustls`/`ring` dates from Task 4.3 and the
+settler's `reqwest-rustls-tls` from Task 6.4; the collision has existed since Phase 6 and only
+shows when one cargo invocation builds both. `cargo build -p tollgate-gateway` alone produces a
+working binary, which is why every previous phase's verification passed — and why this went
+unnoticed.
+
+**Effect if left as is:** whichever cargo command last wrote `target/debug/tollgate-gateway`
+decides whether it runs. `cargo build --workspace` — the command the README's checks section
+names — leaves a binary that dies on its first outbound HTTPS request. Local verification against
+the mock upstream is over plain HTTP and unaffected, so this bites first against a real provider.
+
+**Why deferred, not fixed:** out of scope for Task 7.3, whose Implementation section describes
+two endpoints. The fix is a deliberate choice — call `CryptoProvider::install_default()` at
+gateway startup, or align both crates on one provider — and it belongs in its own commit rather
+than folded into a feed endpoint.
 
 ### Request path is not tolerant of a Postgres outage
 

@@ -56,6 +56,9 @@ const PRIORITY_FEE_WEI: u128 = 1_000_000; // 0.001 gwei
 /// What the chain reported back about one batch.
 pub struct SettlementOutcome {
     pub tx_hash: B256,
+    /// Gas the settlement transaction actually burned, for `/v1/stats` (Task 7.3) — measured,
+    /// not estimated, which is the whole point of `prd.md` §8's "under $0.001" claim.
+    pub gas_used: u64,
     pub settled: Vec<Vec<u8>>,
     /// Nonces the contract emitted `SettleFailed` for. Task 6.5 owns requeueing these with a
     /// retry count; this task only reports them.
@@ -232,6 +235,7 @@ impl<P: Provider> Settler<P> {
             // something structural, since per-item failures are caught inside the contract.
             return Ok(SettlementOutcome {
                 tx_hash: receipt.transaction_hash,
+                gas_used: receipt.gas_used,
                 settled: Vec::new(),
                 failed: items
                     .iter()
@@ -255,6 +259,7 @@ impl<P: Provider> Settler<P> {
 
         Ok(SettlementOutcome {
             tx_hash: receipt.transaction_hash,
+            gas_used: receipt.gas_used,
             settled,
             failed,
         })
