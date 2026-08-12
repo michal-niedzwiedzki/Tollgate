@@ -13,9 +13,10 @@ case, `architecture.md` for the design, and `plan.md` for the build plan.
 
 ## Build status
 
-Phases 0–5 of `plan.md` are complete and committed. The gateway serves the full paid-request path
-with delegation; **settlement is not built yet**, so charges reach `status = 'queued'` in Postgres
-and stop there.
+Phases 0–5 of `plan.md` are complete and committed, as are Tasks 6.1–6.5. The gateway serves the
+full paid-request path with delegation, and the settler turns queued charges into batched on-chain
+transactions. **Settlement has not yet been run against real Base Sepolia** — Task 6.6 is deferred,
+so every settlement to date has been against a local anvil fork. See `NOTES.md`.
 
 | Phase | Scope | State |
 |---|---|---|
@@ -25,18 +26,19 @@ and stop there.
 | 3 | Atomic Lua claim, policy module, status codes, reservation-stream drain | ✅ complete |
 | 4 | SSRF resolve/validate/pin, streaming proxy, promote-or-void | ✅ complete |
 | 5 | Capability EIP-712 type, chain decode + verification, multi-level decrement, revocation, boot rebuild | ✅ complete |
-| 6 | `BatchSettler` contract and settler worker | ⬜ not started |
+| 6 | `BatchSettler` contract and settler worker | 🟡 6.1–6.5 complete, 6.6 (live Base Sepolia run) deferred |
 | 7 | Signed receipts and expense report | ⬜ not started |
 | 8 | Python client library | ⬜ not started |
 | 9 | Dashboard | ⬜ not started |
 | 10 | Demo agents and hardening | ⬜ not started |
 
-`crates/tollgate-settler` is still the `cargo new` stub. `GATEWAY_SIGNING_KEY`,
-`BATCH_SETTLER_ADDRESS` and `RPC_URL` are read at startup but nothing consumes them yet, so
-placeholders are fine until Phase 6.
+`RPC_URL`, `USDC_ADDRESS` and `BATCH_SETTLER_ADDRESS` are consumed by the settler and must point at
+a real chain and a deployed contract for it to do anything. `GATEWAY_SIGNING_KEY` is still read at
+startup but unused until Phase 7, so a placeholder is fine.
 
-**Requirements status:** `prd.md` F1, F2, F3, F4 and F7 are implemented. F5 (settlement), F6
-(receipts), F8 (dashboard) and F9 (client) are not.
+**Requirements status:** `prd.md` F1, F2, F3, F4 and F7 are implemented. F5 (settlement) is built
+and proven against a Base Sepolia fork but not yet demonstrated on the live testnet. F6 (receipts),
+F8 (dashboard) and F9 (client) are not built.
 
 ---
 

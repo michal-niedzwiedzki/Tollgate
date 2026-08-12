@@ -329,6 +329,57 @@ this touched `policy.rs`: a paid request still returns 200, still `XADD`s to the
 Things noticed during execution that are out of scope for the task that surfaced them.
 Not committed to the diff; recorded here per `CLAUDE.md`'s scope rule.
 
+### Task 6.6 — live Base Sepolia deployment and settlement
+
+**Deferred:** 2026-08-08, after Tasks 6.1–6.5 were complete and committed.
+
+**The Phase 6 Gate does not pass.** Four of its eight items require a real transaction on Base
+Sepolia and are unverified: the 10 real paid requests settling in one transaction visible on
+Basescan, the payout address balance increasing by exactly the sum of the charges, the measured
+per-charge cost recorded in the README, and the Basescan link itself. Nothing after this point
+should be read as claiming otherwise, and by `plan.md`'s own rule Phase 7 should not start until
+this is closed.
+
+**What is built and does work.** Everything in Tasks 6.1–6.5: the `BatchSettler` contract, its
+tests, the deploy script, the anvil fork harness, the settler worker with batch selection and
+submission, and per-item retry with bounded attempts. All of it has been exercised end to end
+against a local anvil fork of Base Sepolia using **real native USDC** — so the EIP-712
+verification, the `authorizationState` replay guard and the balance accounting that ran are the
+real contract's, not a mock's. Three paid requests from the gateway settled in one transaction;
+a spent nonce requeued alone with `retry_count` reaching 3 and `status='failed'` while the other
+two settled untouched.
+
+**What is therefore unproven.** Only the things a fork cannot show: that a real Base Sepolia
+transaction lands and is publicly inspectable, and the true all-in gas cost including Base's L1
+data-availability fee. The README's `## Settlement cost` figures are fork-measured execution gas
+and explicitly exclude that L1 component — they are an estimate of the real number, not the real
+number, and Task 6.6 is what replaces them.
+
+**Why deferred:** it needs a funded settler EOA and a funded payer wallet, which only a human with
+browser access to the faucets can obtain. It is not blocked on anything in the code.
+
+**How to finish it, exactly.**
+
+1. Fund a settler EOA with Base Sepolia ETH — a few thousandths is ample at ~0.006 gwei; the
+   deploy is ~384k gas and a 10-item settle ~450k. Faucet: the Coinbase Developer Platform
+   faucet. This wallet pays all gas and needs no USDC.
+2. Fund a payer EOA with Base Sepolia USDC — 0.01 covers 10 requests at the seeded 0.001 price.
+   Faucet: `faucet.circle.com`. This wallet signs payments off-chain and needs **no** ETH.
+3. Both wallets must be plain EOAs with no contract code. USDC's `SignatureChecker` routes any
+   `from` that has code to ERC-1271 instead of `ecrecover`, so a smart wallet — or any of anvil's
+   ten default accounts, all of which are EIP-7702-delegated on Base Sepolia — cannot make a
+   working EIP-3009 payment. Check with `cast code <addr> --rpc-url https://sepolia.base.org`;
+   anything but `0x` is unusable. This cost two debugging sessions in Tasks 6.2 and 6.3; do not
+   rediscover it.
+4. Deploy with `contracts/script/Deploy.s.sol` against `https://sepolia.base.org`. Verify on
+   Basescan with an Etherscan V2 API key, or on Blockscout, which needs no key.
+5. Write `.env.base-sepolia` pointing at the real RPC, the deployed `BATCH_SETTLER_ADDRESS`, and
+   `USDC_ADDRESS=0x036CbD53842c5426634e7929541eC2318f3dCF7e`. That address was confirmed on-chain
+   as native USDC rather than bridged USDC.e: `name`/`symbol` "USDC", `decimals` 6, EIP-712
+   `version` "2", and `authorizationState` present.
+6. Run 10 paid requests through the gateway, then the settler once, and work through the Task 6.6
+   verification block. Replace the README's fork-derived cost figures with the measured ones.
+
 ### Request path is not tolerant of a Postgres outage
 
 **Found:** Phase 3 Gate, verifying "killing Postgres mid-run loses no reservations once it
