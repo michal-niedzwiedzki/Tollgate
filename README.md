@@ -1,13 +1,53 @@
+<div align="center">
+
 # Tollgate
 
-**Spend control and provable receipts for agent API payments, on x402.**
+### Spend control and provable receipts for agent API payments, on x402
 
-Tollgate is an x402-compatible API gateway that adds the three things the x402 protocol leaves out:
-hard spend caps enforced before the upstream call, sub-agent budget delegation via signed EIP-712
-capability chains, and signed per-charge receipts.
+**Hard caps. Scoped sub-agent budgets. Signed receipts.**
+The payment rail is x402 — Tollgate is the control plane on top of it.
 
-The payment rail is x402. Tollgate is the control plane on top of it. See `prd.md` for the product
-case, `architecture.md` for the design, and `plan.md` for the build plan.
+<p>
+<img alt="Rust" src="https://img.shields.io/badge/Rust-Axum%20%C2%B7%20Tower-000000?style=flat-square&logo=rust&logoColor=white">
+<img alt="Solidity" src="https://img.shields.io/badge/Solidity-Foundry-363636?style=flat-square&logo=solidity&logoColor=white">
+<img alt="Python" src="https://img.shields.io/badge/Python-client-3776AB?style=flat-square&logo=python&logoColor=white">
+<img alt="Next.js" src="https://img.shields.io/badge/Next.js-14-000000?style=flat-square&logo=nextdotjs&logoColor=white">
+</p>
+<p>
+<img alt="Protocol" src="https://img.shields.io/badge/protocol-x402-6E56CF?style=flat-square">
+<img alt="Chain" src="https://img.shields.io/badge/Base%20Sepolia-84532-0052FF?style=flat-square">
+<img alt="Token" src="https://img.shields.io/badge/USDC-EIP--3009-2775CA?style=flat-square">
+<img alt="Status" src="https://img.shields.io/badge/status-testnet%20MVP-F5A623?style=flat-square">
+</p>
+
+<img src="assets/agent2.png" alt="The delegation tree: a capped worker in red, a revoked one struck through, a healthy one still spending" width="100%">
+
+<em>The delegation tree, draining live. One worker is <strong>capped</strong>, one is
+<strong>revoked</strong>, one is still spending — while the supervisor's own pool empties above
+them.</em>
+
+</div>
+
+---
+
+## Contents
+
+| | |
+|---|---|
+| [Why this is not just x402](#why-this-is-not-just-x402) | The one-paragraph answer |
+| [Build status](#build-status) | What is done and what is not |
+| [Architecture](#architecture) | The component map and the two rules |
+| [The dashboard](#the-dashboard) | Three views, with screenshots |
+| [Quick start](#quick-start) | Zero to a paid response in 12 seconds |
+| [Walkthrough: paying](#walkthrough-an-unpaid-request-becomes-a-paid-one) | 402 → sign → 200 |
+| [Walkthrough: delegation](#walkthrough-delegation) | The headline feature |
+| [HTTP API](#http-api) | Every endpoint |
+| [Correctness](#how-the-correctness-critical-parts-work) | The atomic claim, TTLs, the crash bridge |
+| [Security](#security) | Replay, SSRF, front-running |
+| [Measured](#measured-against-the-targets) | Numbers, not assertions |
+| [Known boundaries](#known-boundaries) | What is mocked, stated plainly |
+
+---
 
 ## Why this is not just x402
 
@@ -132,6 +172,46 @@ the Redis round-trip, and never an upstream call before the claim succeeds:
    `XADD`, all atomic
 6. proxy to the upstream over a pinned-IP connector, response streamed back
 7. 2xx promotes the reservation to `queued`; anything else voids it and credits every level back
+
+---
+
+## The dashboard
+
+Next.js 14, polling the gateway. Three views, because `architecture.md` §7.4 is blunt about why:
+*"The delegation tree is the product surface. Without it this reads as invisible infrastructure."*
+
+```bash
+cd dashboard && npm run dev      # http://localhost:3000
+```
+
+### 🌳 Agent — the delegation tree
+
+<img src="docs/delegation-tree-capped.png" alt="Delegation tree: one worker capped in red while two siblings keep spending" width="100%">
+
+The screen that matters most, caught at the moment `prd.md` §9 step 3 describes: **one worker has
+hit its cap and stopped, its two siblings are still going, and the supervisor's pool above them is
+draining from all three.** A capped node turns red and reads `capped`; a revoked one is struck
+through; siblings keep filling.
+
+Every charge decrements **every** capability in the chain, which is what makes the supervisor's bar
+move at all — and what makes all three workers stop at once when *it* empties, even though none of
+them individually hit its own cap.
+
+### 🛠️ Provider — wrap an endpoint, watch it earn
+
+<img src="assets/provider.png" alt="Provider registration form and registered providers" width="100%">
+
+Register an upstream, set a price per request, get paid to your own wallet. No billing code, no
+signup for the agent. Submit an upstream that resolves into private address space and the form
+refuses it inline with `unsafe_upstream`.
+
+### 📊 Feed — every charge, and what it cost
+
+<img src="assets/feed.png" alt="Public feed with latency and settlement panels" width="100%">
+
+Latency is shown as **two separate numbers** — Tollgate's added time and the upstream's — because
+`prd.md` §8 warns they will be conflated otherwise. The settlement panel reads `—` rather than a
+fabricated zero until a batch actually settles.
 
 ---
 
@@ -441,6 +521,11 @@ is `403 not_authorised_to_revoke`. Revocations may not be future-dated.
 
 ## HTTP API
 
+<details>
+<summary><b>Every endpoint</b> — click to expand</summary>
+
+<br>
+
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/health` | Liveness of Postgres and Redis. `200` both up, `503` with the failing component `false` |
@@ -506,9 +591,16 @@ A voided charge **does not release the nonce**. The EIP-3009 signature stays rep
 `validBefore`, so freeing the nonce would reopen the free-shopping window; re-presenting a voided
 payment gets `409`, not a retry.
 
+</details>
+
 ---
 
 ## Data model
+
+<details>
+<summary><b>Postgres tables and Redis keys</b> — click to expand</summary>
+
+<br>
 
 ### Postgres
 
@@ -546,6 +638,8 @@ exactly one code path (NOTES.md D4, D5).
 
 There is no `tg:window:*` key — time-window budgets are P1 and out of scope (`plan.md` A4). There is
 no `tg:cb:*` circuit breaker either (A10).
+
+</details>
 
 ---
 
@@ -879,6 +973,11 @@ $0.001 at an ETH price around **$3,744**. Two caveats worth stating rather than 
 
 ## Configuration
 
+<details>
+<summary><b>Every environment variable</b> — click to expand</summary>
+
+<br>
+
 | Variable | Required | Default | Used by |
 |---|---|---|---|
 | `DATABASE_URL` | yes | — | pool, migrations |
@@ -904,9 +1003,14 @@ and fail the `from` check. Native USDC on Base Sepolia (84532) is
 `decimals 6`, EIP-712 `version "2"`, with `authorizationState` present. Native, not bridged
 USDC.e, which does not implement EIP-3009 compatibly.
 
+</details>
+
 ---
 
 ## Repository layout
+
+<details>
+<summary><b>Where everything lives</b> — click to expand</summary>
 
 ```
 Cargo.toml                       workspace root
@@ -939,6 +1043,8 @@ scripts/anvil.sh                 base sepolia fork, funded test EOA
 scripts/loadtest.py              100 paid requests, measured against prd.md §8
 scripts/check.sh                 every check across rust, solidity, python, typescript
 ```
+
+</details>
 
 ---
 
@@ -1017,3 +1123,14 @@ All four are detailed in the "Deferred" section of `NOTES.md`.
 
 **Git policy:** the agent never runs git write commands. Every commit in this repository was made by
 a human after review.
+
+<div align="center">
+<br>
+
+**Testnet only. No real value moves.**
+Base Sepolia · native USDC · `transferWithAuthorization`
+
+<sub>Built with x402 on the wire, because a payment protocol that already exists
+does not need reinventing.</sub>
+
+</div>
