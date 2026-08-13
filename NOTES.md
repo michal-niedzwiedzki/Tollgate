@@ -643,6 +643,30 @@ nothing; for a real provider with many paths it is the difference between an aud
 total. `prd.md` story 2 asks for "payer address, endpoint, upstream status, and settlement
 transaction hash" — "endpoint" is satisfied at provider granularity, not path granularity.
 
+### Task 9.4 — the settlement panel is unverified against live data
+
+**Found:** 2026-08-13, during Task 9.4 verification. A consequence of the Task 6.6 deferral
+above, recorded here because it is what a reader of the feed page actually sees.
+
+Two of Task 9.4's four verification lines cannot run: "gas per charge matches the
+`.gas-snapshot` figure" and "cost per charge displays and can be checked against the under
+$0.001 claim". Both need a settled batch, and no settler has ever run against a real chain, so
+`/v1/stats` returns `gas_per_batch`, `gas_per_charge` and `batch_size` as null. The panel renders
+`—` for all three with the hint "no settled batch yet", which is correct behaviour for absent
+data rather than a fabricated zero (D19's rule).
+
+What *was* verified is the arithmetic between them: the panel's
+`gas × gwei × 1e-9 × ETH_USD` reproduces the README's Settlement cost table exactly — $0.00053,
+$0.00080 and $0.00107 at ETH $2,000 / $3,000 / $4,000 on 44,514 gas. So when a batch does settle
+the figure will be right and will agree with the README by construction.
+
+The USD inputs are display constants (`NEXT_PUBLIC_GAS_PRICE_GWEI`, `NEXT_PUBLIC_ETH_USD`,
+defaulting to the README's 0.006 gwei and $3,000) and the panel says so on screen.
+architecture.md §7.2 forbids a gas oracle, and an ETH price is not something the gateway knows.
+
+**Effect if left as is:** the settlement panel is three dashes until Task 6.6 closes. The latency
+panel beside it is fully live and is the half `prd.md` §8 cares most about.
+
 ### Task 9.2 — the provider log filters client-side
 
 **Found:** 2026-08-13, same review. Also decided by the human.
