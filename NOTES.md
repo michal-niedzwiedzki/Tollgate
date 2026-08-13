@@ -620,3 +620,37 @@ reviewer question attached ("is this claim true yet?"), and Phase 8 is not finis
 passes, so the honest moment to update it is at that gate rather than mid-phase.
 
 **Effect if left as is:** a reader of the root README understates what is built. No code impact.
+
+### Task 9.2 — the provider request log has no `path` column
+
+**Found:** 2026-08-13, before writing Task 9.2. Raised as a blocking question and **decided by the
+human**, who chose to omit `path` rather than reach backwards into Phase 3.
+
+Task 9.2 specifies the log columns as "payer, **path**, upstream status, amount, tx hash". No
+request path is persisted anywhere in the system: `authorisations` has no such column across
+migrations 0001–0005, `claim.lua`'s stream entry does not carry one, and the `payload` JSONB holds
+only the EIP-3009 authorisation (`from`, `to`, `value`, `validAfter`, `validBefore`, `nonce`) —
+verified by reading a live row. `/v1/feed` therefore cannot return one.
+
+**Why deferred, not fixed:** adding it is a five-file change across three phases — a sixth
+migration, a `claim.lua` stream-payload change (Task 3.1), an `insert_reservation` change
+(Task 3.4), a `/v1/feed` change (Task 7.3), and only then the column. Task 9.2's Implementation
+section describes a dashboard view and nothing else, so all but the last of those sit outside it.
+
+**Effect if left as is:** the log identifies *which provider* was paid but not which endpoint
+beneath it. For the demo's mock providers, each of which has one meaningful route, this costs
+nothing; for a real provider with many paths it is the difference between an audit trail and a
+total. `prd.md` story 2 asks for "payer address, endpoint, upstream status, and settlement
+transaction hash" — "endpoint" is satisfied at provider granularity, not path granularity.
+
+### Task 9.2 — the provider log filters client-side
+
+**Found:** 2026-08-13, same review. Also decided by the human.
+
+`/v1/feed` has no `provider` parameter, so the log fetches 200 entries and filters by slug in the
+browser. Adding `?provider=` to `routes/feed.rs` would be a Phase 7 endpoint change made during
+Phase 9, outside Task 9.2's Implementation section.
+
+**Effect if left as is:** a provider whose charges have been pushed out of the newest 200 by
+busier providers shows an empty log even though it has history. Invisible at demo scale, wrong at
+any real one. The fix is the one-line `WHERE` clause above whenever the feed grows past a page.
