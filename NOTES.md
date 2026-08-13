@@ -633,6 +633,55 @@ two endpoints. The fix is a deliberate choice — call `CryptoProvider::install_
 gateway startup, or align both crates on one provider — and it belongs in its own commit rather
 than folded into a feed endpoint.
 
+### The stage histogram has no resolution between 10 ms and 50 ms
+
+**Found:** 2026-08-13, during Task 10.2, by checking whether the load test's reported percentiles
+were real numbers before writing them into the README.
+
+`tollgate_stage_seconds` buckets run `… 0.005, 0.01, 0.05, 0.1 …` (Task 2.5). There is nothing
+between **0.01 and 0.05**, and a debug-build gateway's added latency sits entirely inside that
+gap: all 100 requests of a load-test run landed in the single `(0.01, 0.05]` bucket.
+
+`/v1/stats` interpolates percentiles from those buckets (D19), so it reported `gateway_p50` as
+**exactly 0.030** — the bucket's midpoint — and `gateway_p99` as **exactly 0.050**, its ceiling.
+Both are artifacts of the bucket layout rather than measurements of anything. The histogram's own
+sum and count gave the real figure: a 17.0 ms mean.
+
+The verdicts those artifacts produce are wrong in both directions. p50 0.030 reads as a *miss*
+against the 15 ms target when the mean is 17.0 ms; p99 0.050 reads as a *pass* against the 50 ms
+target purely because interpolation cannot exceed the bucket ceiling.
+
+**Not a problem for the numbers now in the README**, which are from a release build whose samples
+land in resolved buckets (p50 0.003, p99 0.010, mean 2.8 ms). It bites exactly when the gateway is
+slow enough to be interesting, which is the worst time for a latency panel to go blind — and the
+dashboard's latency panel reads the same endpoint.
+
+**Why deferred, not fixed:** the bucket layout belongs to Task 2.5 and `/v1/stats` to Task 7.3.
+Task 10.2's Implementation section describes a load-test script and a README table. Adding buckets
+at 0.015, 0.02 and 0.03 is a one-line change to the histogram registration, but it is a change to
+another phase's code and deserves its own commit.
+
+**Worked around, visibly:** `scripts/loadtest.py` prints the mean from the histogram's sum and
+count beside the percentiles, and says why. The README's Measured section states the same caveat
+rather than quoting the interpolated figure unqualified.
+
+### `cargo run` is a debug build, and the p50 target is a release-build claim
+
+**Found:** 2026-08-13, during Task 10.2.
+
+The same 100-request load test measures a gateway mean of **17.0 ms** on the `cargo run` debug
+binary and **2.8 ms** on `cargo build --release` — a little over 6x. Debug misses `prd.md` §8's
+15 ms p50 target; release clears it with room. Signature recovery is the hot path and is what
+debug builds punish hardest.
+
+Everything the README and every phase gate has measured to date used the debug binary, because
+that is what the quickstart and every verification block run. That was correct for correctness
+checks and misleading for latency ones.
+
+**Why deferred, not fixed:** no task in `plan.md` specifies a build profile, and changing what
+the README's quickstart tells people to run is a documentation decision beyond Task 10.2's scope.
+The Measured table states the profile and gives both figures instead.
+
 ### Request path is not tolerant of a Postgres outage
 
 **Found:** Phase 3 Gate, verifying "killing Postgres mid-run loses no reservations once it

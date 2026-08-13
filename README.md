@@ -594,6 +594,55 @@ phase gate is conditioned on hitting the target; missing it is a tuning problem.
 
 ---
 
+## Measured against the targets
+
+`prd.md` §8 sets the numbers this project claims. `scripts/loadtest.py` measures them rather than
+asserting them: 100 paid requests across 5 parallel workers, all drawing on one shared root
+capability sized to exactly 100 charges.
+
+```bash
+python3 scripts/loadtest.py
+```
+
+Last run, against a **release** gateway and the local mock upstream:
+
+| `prd.md` §8 target | Target | Measured | |
+|---|---|---|---|
+| Added gateway latency, p50 | < 15 ms | **3 ms** (mean 2.8 ms) | ✅ |
+| Added gateway latency, p99 | < 50 ms | **10 ms** | ✅ |
+| End-to-end p50, upstream included | < 150 ms | **32 ms** | ✅ |
+| Requests handled live | 100+ in < 60 s | **100 in 0.7 s** (151/s) | ✅ |
+| Delegation depth demonstrated | 2 levels, 3 workers | `examples/agents/` | ✅ |
+| Provider integration, measured live | < 3 min | **12 s** (see Quick start) | ✅ |
+| Settlement cost per request | < $0.001 | $0.00053–$0.00107 | ⚠️ fork-measured, see Settlement cost |
+
+Four caveats, because each of these numbers is smaller than it looks:
+
+- **Release build only.** The same run against a `cargo run` debug binary gives a gateway mean of
+  **17.0 ms** and misses the p50 target. Signature recovery is the hot path and it is the part
+  debug builds punish hardest. Quote the release figure, and know the development default is not
+  it. Recorded rather than omitted, per `plan.md` A8: missing a target is a tuning problem and
+  gates nothing.
+- **The upstream is the local mock**, answering in ~1 ms. A real provider over the network is the
+  dominant term in the end-to-end figure, which is why `prd.md` §8 asks for the two separately and
+  why `gateway` exists alongside `total`.
+- **The p50 and p99 are interpolated from coarse buckets.** The histogram jumps from 0.01 to 0.05
+  with nothing in between, so a debug run — where every sample lands in that gap — reports a p50
+  of exactly 0.030, the bucket's midpoint, and a p99 of exactly 0.050, its ceiling. Neither is a
+  measurement. The load test prints the mean from the histogram's own sum and count alongside
+  them for this reason. Release samples fall in resolved buckets, so the release percentiles are
+  real.
+- **Nothing settled.** `settled` is 0 and stays 0 until Task 6.6 deploys to Base Sepolia; the
+  charges reach `queued`. The settlement cost row is fork-measured execution gas excluding Base's
+  L1 data-availability fee.
+
+The one hard assertion in the load test is that spend never exceeds the root cap. It sums the
+ledger, not the Redis counters — excluding `voided` and including `failed` (NOTES.md D8, D16) —
+and exits non-zero if the total ever passes the cap. Last run: 0.10 USDC spent against a 0.100
+USDC root cap, 100 charges, zero errors.
+
+---
+
 ## Testing
 
 ```bash
