@@ -1,9 +1,21 @@
 """tollgate-client — the Python client for the Tollgate x402 payment gateway.
 
-Task 8.1 ships the signing layer only. `Session`, the 402 retry loop and `delegate()`
-arrive in Tasks 8.2 and 8.3.
+Tasks 8.1 and 8.2 ship signing and the 402 retry loop. `delegate()` arrives in Task 8.3.
 """
 
+from tollgate.errors import (
+    CapabilityExpired,
+    CapabilityRejected,
+    CapabilityRevoked,
+    CapExceeded,
+    GatewayError,
+    InsufficientBudget,
+    NonceReplay,
+    PaymentFailed,
+    TollgateError,
+    UpstreamFailed,
+)
+from tollgate.session import Session
 from tollgate.signing import (
     DEFAULT_CHAIN_ID,
     DEFAULT_VALIDITY_SECONDS,
@@ -20,6 +32,17 @@ from tollgate.signing import (
 )
 
 __all__ = [
+    "CapExceeded",
+    "CapabilityExpired",
+    "CapabilityRejected",
+    "CapabilityRevoked",
+    "GatewayError",
+    "InsufficientBudget",
+    "NonceReplay",
+    "PaymentFailed",
+    "Session",
+    "TollgateError",
+    "UpstreamFailed",
     "DEFAULT_CHAIN_ID",
     "DEFAULT_VALIDITY_SECONDS",
     "USDC_DECIMALS",
