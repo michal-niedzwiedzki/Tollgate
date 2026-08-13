@@ -633,6 +633,38 @@ two endpoints. The fix is a deliberate choice — call `CryptoProvider::install_
 gateway startup, or align both crates on one provider — and it belongs in its own commit rather
 than folded into a feed endpoint.
 
+### `examples/sign.py chain --hashes` prints subject addresses, not capability hashes
+
+**Found:** 2026-08-13, during Task 10.3, by running every command in the README rather than
+reading them.
+
+The README's revocation walkthrough asks for `--hash 0x<capability hash>`, and the only committed
+tool that produces a chain is `examples/sign.py`. Its `--hashes` flag looks like the way to get
+one. It is not: the flag prints `link['capability']['subject']` — a 20-byte address — so feeding
+its output to the revoke endpoint gives `400 invalid_capability_hash` on the length check, and a
+reader following the README has no way to complete the walkthrough.
+
+Confirmed by reading `cmd_chain` and by running the whole flow: revoke with a genuine leaf hash
+(taken from the Python client's `chain.leaf_hash()`) returns `200` with `revoked_at`, so the
+endpoint is correct and only the harness output is misleading.
+
+Two things are wrong and they are separable. The flag is misnamed for what it prints, which is a
+Task 5.3 harness bug; and the README did not say where a capability hash comes from, which is a
+Task 10.3 documentation bug.
+
+**The documentation half is fixed**, inside this task: the Revocation section now states that
+`--hashes` prints subjects, and names the four working sources — `chain.root_hash()` /
+`chain.leaf_hash()` on the Python client, `supervisor.py setup`'s printed root, the
+`capability_hash` and per-level `chain` carried in any 402 or 429 refusal body, and the dashboard.
+
+**Why the harness half is deferred:** `examples/sign.py` is Phase 5's throwaway signing harness
+(D10) and Task 10.3's Implementation section describes the README. Renaming the flag to
+`--subjects`, or making it print the struct hash it already computes as `parent` on the next
+iteration, is a one-line change to another phase's file and belongs in its own commit.
+
+**Effect if left as is:** the harness is now documented as not providing the hash, so nobody is
+stranded, but the flag still reads as though it does.
+
 ### The stage histogram has no resolution between 10 ms and 50 ms
 
 **Found:** 2026-08-13, during Task 10.2, by checking whether the load test's reported percentiles

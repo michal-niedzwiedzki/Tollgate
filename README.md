@@ -9,14 +9,34 @@ capability chains, and signed per-charge receipts.
 The payment rail is x402. Tollgate is the control plane on top of it. See `prd.md` for the product
 case, `architecture.md` for the design, and `plan.md` for the build plan.
 
+## Why this is not just x402
+
+The first question anyone asks, so it is answered here rather than further down.
+
+x402 solved the *payment* half of agent API access: an agent pays per request in USDC with no
+signup, no card, and no legal person behind the account. It deliberately does not solve the
+*control* half, and that is the whole of what Tollgate adds:
+
+| x402 gives you | x402 leaves out | Tollgate |
+|---|---|---|
+| A 402 with machine-readable payment requirements | Nothing stops a runaway loop. x402 settles what it is told to settle | Per-request and total caps enforced **atomically before the upstream call**, in one Lua script |
+| A payment header the server verifies and settles | A parent agent cannot give a sub-agent a scoped budget without sharing its key or running a wallet fleet | EIP-712 capability chains: attenuation-only, verified at the gateway, **no round-trip to the parent** |
+| A transfer on a block explorer | No artifact proving *what* was bought — which endpoint, which sub-agent, whether the upstream even returned 200 | A signed receipt per charge and a signed expense report rolling up the delegation tree |
+
+Everything on the wire is x402. An off-the-shelf x402 client pays a Tollgate 402 with no
+Tollgate-specific code, because inventing a protocol was an explicit non-goal (`prd.md` §13
+decision 1).
+
 ---
 
 ## Build status
 
-Phases 0–5 of `plan.md` are complete and committed, as are Tasks 6.1–6.5. The gateway serves the
-full paid-request path with delegation, and the settler turns queued charges into batched on-chain
-transactions. **Settlement has not yet been run against real Base Sepolia** — Task 6.6 is deferred,
-so every settlement to date has been against a local anvil fork. See `NOTES.md`.
+All 46 tasks of `plan.md` Phases 0–9 are complete and committed, and Phase 10 is in progress.
+**One item is outstanding and it is load-bearing:** Task 6.6, the live Base Sepolia deployment and
+settlement, is deferred. Every settlement to date has run against a local anvil fork of Base
+Sepolia — with real native USDC, so the EIP-712 verification, the `authorizationState` replay
+guard and the balance accounting are the real contract's — but no transaction has landed on the
+public testnet. See `NOTES.md`.
 
 | Phase | Scope | State |
 |---|---|---|
@@ -27,18 +47,61 @@ so every settlement to date has been against a local anvil fork. See `NOTES.md`.
 | 4 | SSRF resolve/validate/pin, streaming proxy, promote-or-void | ✅ complete |
 | 5 | Capability EIP-712 type, chain decode + verification, multi-level decrement, revocation, boot rebuild | ✅ complete |
 | 6 | `BatchSettler` contract and settler worker | 🟡 6.1–6.5 complete, 6.6 (live Base Sepolia run) deferred |
-| 7 | Signed receipts and expense report | ⬜ not started |
-| 8 | Python client library | ⬜ not started |
-| 9 | Dashboard | ⬜ not started |
-| 10 | Demo agents and hardening | ⬜ not started |
+| 7 | Signed receipts and expense report | ✅ complete |
+| 8 | Python client library | ✅ complete |
+| 9 | Dashboard: provider, delegation tree, public feed | ✅ complete |
+| 10 | Demo agents, load test, docs, hardening | 🟡 10.1–10.3 complete, 10.4 (demo rehearsal) outstanding |
 
 `RPC_URL`, `USDC_ADDRESS` and `BATCH_SETTLER_ADDRESS` are consumed by the settler and must point at
-a real chain and a deployed contract for it to do anything. `GATEWAY_SIGNING_KEY` is still read at
-startup but unused until Phase 7, so a placeholder is fine.
+a real chain and a deployed contract for it to do anything.
 
-**Requirements status:** `prd.md` F1, F2, F3, F4 and F7 are implemented. F5 (settlement) is built
-and proven against a Base Sepolia fork but not yet demonstrated on the live testnet. F6 (receipts),
-F8 (dashboard) and F9 (client) are not built.
+**Requirements status:** `prd.md` F1, F2, F3, F4, F6, F7, F8 and F9 are implemented. F5
+(settlement) is built and proven against a Base Sepolia fork but **not yet demonstrated on the
+live testnet**.
+
+---
+
+## Architecture
+
+```
+                            ┌────────────────────────────┐
+  Supervisor agent          │      TOLLGATE GATEWAY      │
+      │ signs EIP-712       │      Rust / Axum / Tower   │
+      │ capability          │                            │──► Upstream API
+      ▼    (no server call) │  · x402 402 responder      │    (provider's service)
+  Worker agents ── HTTP ───►│  · EIP-3009 verifier       │
+  (+ tollgate-client)       │  · capability chain walker │
+      ▲                     │  · atomic policy claim     │
+      │  402 + requirements │  · SSRF-pinned proxy       │
+      └─────────────────────│  · receipt signer          │
+                            └──────┬─────────────────────┘
+                                   │
+                    ┌──────────────┼───────────────┐
+                    ▼              ▼               ▼
+             ┌───────────┐  ┌───────────┐  ┌──────────────┐
+             │  Redis    │  │ Postgres  │  │  SETTLER     │
+             │  budgets  │  │ ledger    │  │  worker      │
+             │  nonces   │  │ providers │  │  (Rust)      │
+             │  caps     │  │ capabs    │  └──────┬───────┘
+             │  reserve  │  │ receipts  │         │ one tx per batch
+             │  stream   │  └───────────┘         ▼
+             └───────────┘         ▲       ┌─────────────────┐
+                                   │       │  BASE SEPOLIA   │
+                           ┌───────┴────┐  │  USDC (EIP-3009)│
+                           │ DASHBOARD  │  │  BatchSettler   │
+                           │ Next.js 14 │  │  (holds nothing)│
+                           └────────────┘  └─────────────────┘
+```
+
+Two rules the whole design follows (`architecture.md` §1):
+
+**Nothing touches a chain inside the request path.** The gateway verifies a signature locally,
+claims budget in Redis, and proxies. Settlement runs on a separate timer, in batches. Break this
+and the p99 becomes block time.
+
+**Do not invent a protocol.** x402 already defines the 402 shape, the payment header and the
+`exact` scheme. The build days go into the layer x402 does not have: delegation, atomic caps, and
+signed receipts.
 
 ---
 
@@ -356,6 +419,20 @@ curl -X POST localhost:8080/v1/capabilities/0x<hash>/revoke \
      -H 'content-type: application/json' -d "$BODY"
 ```
 
+**Where `<capability hash>` comes from**, since every endpoint that takes one also needs one to
+begin with. `examples/sign.py chain --hashes` does *not* print it — despite the name it prints
+each link's subject address. The working sources are the Python client, which is the intended
+one:
+
+```python
+chain = supervisor.delegate(subject=worker, max_total="0.10", max_per_request="0.05")
+chain.root_hash(), chain.leaf_hash()     # the two you actually want
+```
+
+or, without the client: `examples/agents/supervisor.py setup` prints the root hash, any `402`
+or `429` refusal body carries `capability_hash` plus a per-level `chain` of hashes, and the
+dashboard's delegation tree shows one per node.
+
 Signed by the capability's issuer **or any ancestor issuer** — an ancestor can revoke a descendant,
 and revoking a parent blocks every child whose chain includes it. A revocation from an unrelated key
 is `403 not_authorised_to_revoke`. Revocations may not be future-dated.
@@ -614,7 +691,12 @@ Last run, against a **release** gateway and the local mock upstream:
 | Requests handled live | 100+ in < 60 s | **100 in 0.7 s** (151/s) | ✅ |
 | Delegation depth demonstrated | 2 levels, 3 workers | `examples/agents/` | ✅ |
 | Provider integration, measured live | < 3 min | **12 s** (see Quick start) | ✅ |
-| Settlement cost per request | < $0.001 | $0.00053–$0.00107 | ⚠️ fork-measured, see Settlement cost |
+| Gas per charge, batch of 50 | — | **44,514** (40,846 execution) | ⚠️ fork-measured |
+| Settlement cost per charge | < $0.001 | **$0.00053–$0.00107** at ETH $2k–$4k | ⚠️ fork-measured |
+
+Every figure above is measured. The two marked ⚠️ come from `forge test` and a Base Sepolia fork
+rather than the public testnet, so they exclude Base's L1 data-availability fee; Task 6.6 replaces
+them with the all-in number. Derivation is in [Settlement cost](#settlement-cost).
 
 Four caveats, because each of these numbers is smaller than it looks:
 
@@ -646,12 +728,12 @@ USDC root cap, 100 charges, zero errors.
 ## Testing
 
 ```bash
-cargo test --workspace                 # 85 unit tests, no external dependencies
+cargo test --workspace                 # 111 unit tests, no external dependencies
 cargo test --workspace -- --ignored    # 19 integration tests, needs Postgres + Redis up
 cargo clippy --workspace -- -D warnings
 ```
 
-Last run on this tree: **85 passed / 0 failed** unit, **19 passed / 0 failed** integration, clippy
+Last run on this tree: **111 passed / 0 failed** unit, **19 passed / 0 failed** integration, clippy
 clean.
 
 The integration tests read `DATABASE_URL` and `REDIS_URL` from the environment and each build a
@@ -829,7 +911,7 @@ USDC.e, which does not implement EIP-3009 compatibly.
 ```
 Cargo.toml                       workspace root
 docker-compose.yml               postgres 16 + redis 7 (AOF, everysec)
-migrations/                      0001_init.sql, 0002_chain_hashes.sql
+migrations/                      0001_init … 0005_gas_used.sql
 crates/
   tollgate-core/                 config, types, db + redis pools, error body, stage timer
   tollgate-gateway/              the axum binary
@@ -840,14 +922,22 @@ crates/
     src/lua/claim.lua            the atomic claim
     src/proxy.rs                 pinned-IP connector, streaming passthrough
     src/ssrf.rs                  resolve + IP denylist
-    src/ledger.rs                stream drain, promote/void, boot rebuild
-    src/routes/                  providers, budgets, capabilities, proxy, health, metrics
-  tollgate-settler/              stub until Phase 6
+    src/ledger.rs                stream drain, promote/void, boot rebuild, receipts
+    src/routes/                  providers, budgets, capabilities, proxy, receipts,
+                                 expense, feed, health, metrics
+  tollgate-settler/              batch selection, submission, retries
+contracts/                       BatchSettler.sol, tests, deploy script
+client/tollgate/                 the Python client: session, capability, signing, errors
+dashboard/app/                   next.js: /provider, /agent, /feed
 examples/
   mock_upstream.py               deterministic paid upstream
   sign.py                        throwaway EIP-712/EIP-3009 signing harness
+  agents/                        supervisor + 3 workers, the prd.md §9 demo
 scripts/dev.sh                   compose up + wait + migrate
 scripts/seed_providers.sh        register the three mock providers
+scripts/anvil.sh                 base sepolia fork, funded test EOA
+scripts/loadtest.py              100 paid requests, measured against prd.md §8
+scripts/check.sh                 every check across rust, solidity, python, typescript
 ```
 
 ---
@@ -859,31 +949,59 @@ Stated up front, because a stated boundary reads better than a discovered one
 
 - **Testnet only.** Base Sepolia, testnet USDC, no mainnet, no real value.
 - **One chain.** Multichain is described in the design, not deployed. The design is per-chain
-  isolated with no bridge.
-- **Nothing settles yet.** Charges reach `queued` and stop; Phase 6 builds `BatchSettler` and the
-  settler worker.
-- **Delegation funds children up front** (Resolution A): the parent sends USDC to each child wallet,
-  and the capability chain is pure policy constraining money the child already holds. The parent
-  cannot claw back unspent funds without the child's cooperation, and each child costs one on-chain
-  transfer. Channel-backed delegation (Resolution B) is designed and described, not built.
-- **The settler key will be a hot key in an env var.** This matters less than it looks: the settler
-  cannot invent, inflate or redirect a charge, because all three are inside the payer's signature
-  and checked by USDC. Production still wants a KMS or a threshold signer.
+  isolated with no bridge, so it is an afternoon of work later rather than an architectural change.
+- **Settlement has never run against the live testnet.** The `BatchSettler` contract and the settler
+  worker are built and exercised end to end, but only against a local anvil fork of Base Sepolia.
+  Task 6.6 — the real deployment and the first public transaction — is outstanding.
 - **Provider onboarding is a form.** No email, no verification, no reputation.
-- **Exactly-once, honestly.** The EIP-3009 nonce is the idempotency key at every layer — gateway
-  dedup, stream dedup, Postgres PK, and USDC's `authorizationState` on-chain. On-chain that is
-  at-most-once and the chain enforces it; off-chain the settler will be at-least-once with
-  idempotent retries. Composed, it is effectively-once. A full Redis wipe loses only in-flight
-  reservations not yet drained — a bounded window of seconds.
+- **The settler key is a hot key in an env var.** Production wants a KMS or a threshold signer.
+  This matters less than it looks: the settler cannot invent, inflate or redirect a charge, because
+  `to` and `value` are inside the payer's signature and checked by USDC, and `BatchSettler` holds
+  no funds and has no owner, no pause and no upgrade path (`architecture.md` §6).
+- **Delegation ships with Resolution A funding.** The parent sends USDC to each child wallet up
+  front and the capability chain is pure policy constraining money the child already holds. The
+  parent cannot claw back unspent funds without the child's cooperation, and each child costs one
+  on-chain transfer. Channel-backed delegation (Resolution B) is designed and described, not built.
+- **A Redis loss loses only undrained in-flight reservations** — a bounded window of seconds
+  between the atomic claim and the stream drain landing the row in Postgres. **Do not read this as
+  exactly-once across a Redis wipe**, because it is not (`architecture.md` §9.3).
+- **Settlement is effectively-once, not exactly-once.** The EIP-3009 nonce is the idempotency key
+  at every layer: gateway dedup, stream dedup, Postgres primary key, and USDC's
+  `authorizationState` on-chain. On-chain that composition is *at-most-once* and the chain enforces
+  it; off-chain the settler is *at-least-once* with idempotent retries. Compose the two and you get
+  effectively-once, which is the honest description and the one to use (`architecture.md` §9.4).
+- **Settler throughput ceiling: ~25 settlements per second.** One in-flight transaction at a time
+  so the settler EOA's nonces stay sequential — roughly one batch per block, at 50 per batch and
+  Base's 2-second blocks. Comfortably above `prd.md` §8's 100-requests-in-60-seconds target, but a
+  real ceiling. The production fix is several settler EOAs behind a nonce allocator, not built.
+- **`transferWithAuthorization` front-running is bounded, not absent.** Batching requires it —
+  `receiveWithAuthorization` demands `msg.sender == to`, which breaks batching. An observer who
+  replays the payload from the mempool executes exactly the transfer the payer signed, to the
+  recipient the payer signed, and pays the gas themselves. It affects ordering, not custody.
+- **Deny-by-default egress is a deployment requirement this application does not enforce.**
+  `architecture.md` §10 asks for the proxy's egress to run under a deny-by-default network policy
+  so that an SSRF bypass reaches nothing. That is a deployment control, not application code
+  (`plan.md` A12). The gateway implements resolve, validate and pin; the network policy is on
+  whoever runs it.
 - **Out of scope by decision:** the `upto` scheme, time-window budgets, circuit breakers, on-chain
   refunds of settled charges, and the `tollgate wrap` CLI.
 
 ### Open items carried forward
 
 - The off-the-shelf x402 client interop demonstration (Phase 2 Gate) is not recorded as run.
+- **`cargo build --workspace` produces a gateway that panics on its first HTTPS request.** The
+  gateway asks `hyper-rustls` for `ring` and the settler pulls `aws-lc-rs` transitively through
+  `alloy`; building both in one invocation unifies the features and leaves rustls with two crypto
+  providers and no default. `cargo build -p tollgate-gateway` alone is fine, and traffic to the
+  local mock upstream is plain HTTP, which is why this has gone unnoticed. It bites against a real
+  provider.
 - The request path does not tolerate a Postgres outage: provider lookup hits Postgres before any
   Redis logic, so a blip makes in-flight requests `500` rather than degrading. Fail-closed, no data
-  loss, no mis-attribution. See the "Deferred" section of `NOTES.md`.
+  loss, no mis-attribution.
+- `/v1/stats` percentiles are interpolated from histogram buckets that jump 0.01 → 0.05, so a
+  gateway running slower than 10 ms per request reports bucket edges rather than measurements.
+
+All four are detailed in the "Deferred" section of `NOTES.md`.
 
 ---
 
@@ -894,7 +1012,7 @@ Stated up front, because a stated boundary reads better than a discovered one
 | `prd.md` | Product requirements, target users, success metrics, the honest business case |
 | `architecture.md` | The design: request lifecycle, delegation, concurrency, security, data model |
 | `plan.md` | The 46-task build plan, phase by phase, with a gate per phase |
-| `NOTES.md` | Decisions taken during execution (D1–D11), post-mortems on bugs found and fixed, and deferred items |
+| `NOTES.md` | Decisions taken during execution (D1–D22), post-mortems on bugs found and fixed, and deferred items |
 | `EXECUTING.md` | How this repo is built with Claude Code, and the git policy |
 
 **Git policy:** the agent never runs git write commands. Every commit in this repository was made by
