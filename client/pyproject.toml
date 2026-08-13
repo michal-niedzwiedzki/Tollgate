@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tollgate-client"
+version = "0.1.0"
+description = "Python client for the Tollgate x402 payment gateway: 402 handling, EIP-3009 signing, and local capability delegation."
+requires-python = ">=3.9"
+dependencies = [
+    "httpx",
+    "eth-account",
+    "eth-utils",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools]
+packages = ["tollgate"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

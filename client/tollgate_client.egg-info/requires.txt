@@ -1,0 +1,6 @@
+httpx
+eth-account
+eth-utils
+
+[dev]
+pytest

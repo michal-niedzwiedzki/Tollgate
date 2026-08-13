@@ -205,3 +205,109 @@ mod recover {
         assert_eq!(err, VerifyError::HighS);
     }
 }
+
+/// The cross-language check: a payment header produced by the Python client, verified here.
+///
+/// `mod recover` above signs with `alloy` and recovers with `alloy`, so it proves this file
+/// is self-consistent and nothing more. An EIP-712 signature is over an encoding, and the
+/// only way to know Python's encoding matches is to verify Python's bytes — which is what
+/// this does.
+///
+/// The fixture is written by `client/tests/test_signing.py` and committed, and it is pulled
+/// in with `include_str!` so a missing or unreadable one is a compile error rather than a
+/// test that quietly passes by skipping.
+#[cfg(test)]
+mod python_vector {
+    use super::*;
+    use crate::x402::decode::decode_payment_header;
+
+    const VECTOR: &str = include_str!("../tests/fixtures/payment_vector.json");
+
+    /// Everything `recover_payer` reads is `chain_id` and `usdc_address`; both come from the
+    /// fixture so the vector, not this file, decides what it was signed against.
+    fn config_for(chain_id: u64, usdc_address: &str) -> Config {
+        Config {
+            database_url: "postgres://postgres:postgres@localhost:5432/tollgate".to_string(),
+            redis_url: "redis://localhost:6379".to_string(),
+            bind_addr: "0.0.0.0:8080".parse().unwrap(),
+            chain_id,
+            rpc_url: "http://localhost:8545".to_string(),
+            usdc_address: usdc_address.to_string(),
+            batch_settler_address: "0x0000000000000000000000000000000000000001".to_string(),
+            settler_private_key: "0xabc".to_string(),
+            gateway_signing_key: "0xdef".to_string(),
+            quote_validity_seconds: 300,
+            clock_skew_seconds: 60,
+            settler_batch_size: 50,
+            settler_flush_seconds: 10,
+        }
+    }
+
+    fn vector() -> serde_json::Value {
+        serde_json::from_str(VECTOR).expect("payment vector should be valid JSON")
+    }
+
+    #[test]
+    fn a_python_signed_header_decodes_and_recovers_the_expected_payer() {
+        let vector = vector();
+        let cfg = config_for(
+            vector["chainId"].as_u64().expect("chainId"),
+            vector["usdcAddress"].as_str().expect("usdcAddress"),
+        );
+        let expected: Address = vector["expectedPayer"]
+            .as_str()
+            .expect("expectedPayer")
+            .parse()
+            .expect("expectedPayer should be an address");
+
+        let payload = decode_payment_header(vector["header"].as_str().expect("header"))
+            .expect("the python header should decode");
+
+        let recovered = recover_payer(&payload, &cfg).expect("the python signature should verify");
+        assert_eq!(
+            recovered, expected,
+            "python and rust disagree on the TransferWithAuthorization encoding"
+        );
+    }
+
+    #[test]
+    fn the_decoded_header_carries_the_fields_python_signed() {
+        let vector = vector();
+        let payload = decode_payment_header(vector["header"].as_str().expect("header"))
+            .expect("the python header should decode");
+        let signed = &vector["payload"]["payload"]["authorization"];
+        let auth = &payload.payload.authorization;
+
+        assert_eq!(payload.scheme, "exact");
+        assert_eq!(payload.network, "eip155:84532");
+        assert_eq!(auth.value.to_string(), signed["value"].as_str().unwrap());
+        assert_eq!(
+            auth.valid_before.to_string(),
+            signed["validBefore"].as_str().unwrap()
+        );
+        assert_eq!(
+            format!("{:#x}", auth.nonce),
+            signed["nonce"].as_str().unwrap()
+        );
+    }
+
+    /// The negative half. Recovery that succeeds against the wrong domain would mean the
+    /// domain is not actually binding, and a payment signed for one token or one chain would
+    /// be replayable against another (`architecture.md` §10, cross-chain replay).
+    #[test]
+    fn the_same_header_fails_against_a_different_verifying_contract() {
+        let vector = vector();
+        let cfg = config_for(
+            vector["chainId"].as_u64().expect("chainId"),
+            "0x0000000000000000000000000000000000000002",
+        );
+
+        let payload = decode_payment_header(vector["header"].as_str().expect("header"))
+            .expect("the python header should decode");
+
+        assert_eq!(
+            recover_payer(&payload, &cfg).unwrap_err(),
+            VerifyError::SignerMismatch
+        );
+    }
+}

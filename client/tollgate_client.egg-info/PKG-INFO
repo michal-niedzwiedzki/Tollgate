@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: tollgate-client
+Version: 0.1.0
+Summary: Python client for the Tollgate x402 payment gateway: 402 handling, EIP-3009 signing, and local capability delegation.
+Requires-Python: >=3.9
+Requires-Dist: httpx
+Requires-Dist: eth-account
+Requires-Dist: eth-utils
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
