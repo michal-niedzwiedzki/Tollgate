@@ -19,6 +19,15 @@ class TollgateError(Exception):
     """Base class for every error this client raises."""
 
 
+class AttenuationError(TollgateError):
+    """A delegation that would grant more than the delegator holds.
+
+    Raised locally, before signing. A capability can never grant more than it holds
+    (`architecture.md` §5.2 rule 4), and the gateway rejects such a chain as *malformed* —
+    a 400, not a policy refusal — so producing one is always a bug in the caller.
+    """
+
+
 class GatewayError(TollgateError):
     """A refusal from the gateway, carrying the response that explained it."""
 

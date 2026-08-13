@@ -1,9 +1,16 @@
 """tollgate-client — the Python client for the Tollgate x402 payment gateway.
 
-Tasks 8.1 and 8.2 ship signing and the 402 retry loop. `delegate()` arrives in Task 8.3.
+Signing, the 402 retry loop, and local capability delegation.
 """
 
+from tollgate.capability import (
+    Capability,
+    CapabilityChain,
+    ChainLink,
+    allowlist_hash,
+)
 from tollgate.errors import (
+    AttenuationError,
     CapabilityExpired,
     CapabilityRejected,
     CapabilityRevoked,
@@ -32,6 +39,11 @@ from tollgate.signing import (
 )
 
 __all__ = [
+    "AttenuationError",
+    "Capability",
+    "CapabilityChain",
+    "ChainLink",
+    "allowlist_hash",
     "CapExceeded",
     "CapabilityExpired",
     "CapabilityRejected",

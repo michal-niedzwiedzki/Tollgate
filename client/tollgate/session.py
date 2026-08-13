@@ -20,13 +20,22 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import time
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 import httpx
 from eth_account import Account
 
 from tollgate import signing
+from tollgate.capability import (
+    CapabilityChain,
+    ChainLink,
+    allowlist_hash,
+    build_capability,
+    check_attenuation,
+)
 from tollgate.errors import (
     CapabilityExpired,
     CapabilityRejected,
@@ -43,6 +52,8 @@ from tollgate.errors import (
 NETWORKS = {
     "base-sepolia": "eip155:84532",
 }
+
+_ZERO32 = "0x" + "00" * 32
 
 PAYMENT_HEADER = "X-PAYMENT"
 CAPABILITY_HEADER = "X-Tollgate-Capability"
@@ -77,10 +88,11 @@ class Session:
         self,
         signer: str,
         network: str = "base-sepolia",
-        capability: Optional[str] = None,
+        capability: Optional[Any] = None,
         *,
         client: Optional[httpx.Client] = None,
         timeout: float = 30.0,
+        gateway: Optional[str] = None,
     ):
         if network not in NETWORKS:
             raise ValueError(f"unsupported network {network!r}; known: {sorted(NETWORKS)}")
@@ -89,12 +101,24 @@ class Session:
         self.address = Account.from_key(signer).address
         self.network = network
         self.caip2_network = NETWORKS[network]
-        self.capability = capability
+        self.chain_id = int(self.caip2_network.split(":")[1])
+        # Accepts either the base64 header or the `CapabilityChain` `delegate()` returns, so
+        # the architecture.md §7.3 sample's `Session(capability=worker_budget)` just works.
+        self.capability = str(capability) if capability is not None else None
+
+        # Where `expense_report()` looks. `get`/`post` take full URLs, so a session that has
+        # made a request already knows; one that has only delegated — the supervisor in
+        # architecture.md §7.3 — does not, and needs this or the environment to say.
+        self.gateway = gateway or os.environ.get("TOLLGATE_GATEWAY")
+        self._last_origin: Optional[str] = None
 
         self._client = client or httpx.Client(timeout=timeout)
         self._receipts: List[Dict[str, Any]] = []
+        self._chain = _parse_chain(self.capability, self.chain_id)
+        # Roots this session has issued, so `expense_report()` knows what tree to ask about.
+        self._issued_roots: List[str] = []
         # The mirror: the leaf's per-request cap and expiry, and nothing else.
-        self._max_per_request, self._expiry = _mirror(capability)
+        self._max_per_request, self._expiry = _mirror(self._chain)
 
     # -- public API ---------------------------------------------------------------
 
@@ -114,6 +138,7 @@ class Session:
         # Expiry is the half of the mirror that needs no quote, so it costs zero requests.
         # Sending a payment under an expired capability is a guaranteed 403.
         self._check_not_expired()
+        self._remember_origin(url)
 
         unpaid = self._client.request(method, url, **kwargs)
         if unpaid.status_code != 402:
@@ -136,6 +161,108 @@ class Session:
             # Never a second retry: the loop stops here whatever the reason.
             self._raise_for_body(paid, _parse_quote(paid).body, repeat=True)
         return self._finish(paid)
+
+    def delegate(
+        self,
+        subject: str,
+        max_total: str,
+        max_per_request: str,
+        allowlist: Optional[List[str]] = None,
+        expiry_seconds: int = 600,
+        max_depth: int = 1,
+    ) -> CapabilityChain:
+        """Grants `subject` a scoped budget. One local signature, zero HTTP requests.
+
+        That last clause is the feature, not an optimisation: a supervisor can fan out to a
+        hundred workers without the gateway ever being in the loop, and the gateway still
+        enforces every limit because the limits are inside the signature it will verify.
+
+        Returns the parent's chain plus the new link, root first — ready to hand to a worker
+        as `Session(capability=...)`.
+        """
+        allowlist = list(allowlist or [])
+        parent = self._chain.leaf if self._chain else None
+
+        capability = build_capability(
+            issuer=self.address,
+            subject=subject,
+            # A root's parent is 0x0 (NOTES.md D6: not a row, just the sentinel).
+            parent_hash=(
+                parent.capability.struct_hash(self.chain_id) if parent else _ZERO32
+            ),
+            max_total=signing.to_base_units(max_total),
+            max_per_request=signing.to_base_units(max_per_request),
+            allowlist=allowlist,
+            expiry_seconds=expiry_seconds,
+            max_depth=max_depth,
+        )
+
+        if parent is not None:
+            check_attenuation(
+                parent,
+                capability,
+                child_allowlist=allowlist,
+                parent_allowlist=self._chain.effective_allowlist(),
+            )
+
+        link = ChainLink(
+            capability=capability,
+            signature=capability.sign(self.signer, self.chain_id),
+            allowlist=allowlist,
+        )
+        links = ([*self._chain.links] if self._chain else []) + [link]
+        chain = CapabilityChain(links, self.chain_id)
+        self._issued_roots.append(chain.root_hash())
+        return chain
+
+    def expense_report(self, capability: Optional[Any] = None) -> Dict[str, Any]:
+        """The signed spend rollup for this session's tree (`prd.md` user story 8).
+
+        Which tree that is depends on what the session is. A worker holding a chain reports on
+        its root. A supervisor holding none reports on the root it issued — and if it issued
+        several, it has several trees and must say which, because the endpoint aggregates one
+        subtree at a time. A session that has neither reports on its own payer budget.
+        """
+        params = {"capability": _root_param(capability, self.chain_id)} if capability else None
+        if params is None:
+            params = {"capability": self._report_root()} if self._report_root() else {
+                "payer": self.address
+            }
+
+        response = self._client.get(f"{self._gateway_base()}/v1/expense-report", params=params)
+        if response.status_code >= 400:
+            self._raise_for_body(response, _json_or_none(response))
+        return response.json()
+
+    def _report_root(self) -> Optional[str]:
+        if self._chain:
+            return self._chain.root_hash()
+        unique = list(dict.fromkeys(self._issued_roots))
+        if len(unique) == 1:
+            return unique[0]
+        if len(unique) > 1:
+            raise ValueError(
+                f"this session issued {len(unique)} root capabilities, which are separate "
+                f"delegation trees; pass one explicitly as "
+                f"expense_report(capability=...): {unique}"
+            )
+        return None
+
+    def _remember_origin(self, url: str) -> None:
+        parts = urlsplit(url)
+        if parts.scheme and parts.netloc:
+            self._last_origin = f"{parts.scheme}://{parts.netloc}"
+
+    def _gateway_base(self) -> str:
+        """The gateway this session talks to: explicit, then the environment, then wherever
+        its last request went."""
+        base = self.gateway or self._last_origin
+        if base is None:
+            raise ValueError(
+                "no gateway known: pass Session(gateway=...), set TOLLGATE_GATEWAY, or make "
+                "a request first"
+            )
+        return base.rstrip("/")
 
     def receipts(self) -> List[Dict[str, Any]]:
         """Every receipt this session collected, oldest first.
@@ -176,9 +303,7 @@ class Session:
     def _leaf_level(self) -> Optional[int]:
         """Index of the link the mirror describes: the leaf, which is the one this session
         signs as."""
-        if not self.capability:
-            return None
-        return len(_decode_chain(self.capability)) - 1
+        return len(self._chain) - 1 if self._chain else None
 
     # -- request plumbing ---------------------------------------------------------
 
@@ -328,22 +453,35 @@ def _with_headers(kwargs: Dict[str, Any], extra: Dict[str, str]) -> Dict[str, An
     return merged
 
 
-def _decode_chain(capability: str) -> List[Dict[str, Any]]:
-    """The chain header as a list of links, root first."""
-    return json.loads(base64.b64decode(capability))
-
-
-def _mirror(capability: Optional[str]):
-    """The leaf's per-request cap and expiry — the only policy this client copies.
-
-    Deliberately forgiving: a chain this cannot parse yields no mirror rather than an error,
-    because the mirror is an optimisation and the gateway is the authority. A malformed chain
-    still gets rejected, just one round trip later and by the component that decides.
-    """
+def _parse_chain(capability: Optional[str], chain_id: int) -> Optional[CapabilityChain]:
+    """Deliberately forgiving: a chain this cannot parse yields `None` rather than raising,
+    because everything the client does with it is an optimisation and the gateway is the
+    authority. A malformed chain still gets rejected, just one round trip later and by the
+    component whose job it is to decide."""
     if not capability:
-        return None, None
+        return None
     try:
-        leaf = _decode_chain(capability)[-1]["capability"]
-        return int(leaf["maxPerRequest"]), int(leaf["expiry"])
-    except (ValueError, KeyError, IndexError, TypeError):
+        return CapabilityChain.deserialize(capability, chain_id)
+    except (ValueError, KeyError, IndexError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _mirror(chain: Optional[CapabilityChain]):
+    """The leaf's per-request cap and expiry — the only policy this client copies."""
+    if chain is None:
         return None, None
+    leaf = chain.leaf.capability
+    return leaf.max_per_request, leaf.expiry
+
+
+def _root_param(capability: Any, chain_id: int) -> str:
+    """A capability hash for the expense-report query, from a hash, a chain, or a header."""
+    if isinstance(capability, CapabilityChain):
+        return capability.root_hash()
+    text = str(capability)
+    if text.startswith("0x") and len(text) == 66:
+        return text
+    chain = _parse_chain(text, chain_id)
+    if chain is None:
+        raise ValueError(f"not a capability hash or chain: {text[:32]}…")
+    return chain.root_hash()
