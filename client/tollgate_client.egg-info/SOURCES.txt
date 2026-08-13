@@ -1,5 +1,6 @@
 README.md
 pyproject.toml
+../LICENSE
 tests/test_capability.py
 tests/test_e2e.py
 tests/test_session.py

@@ -6,6 +6,9 @@ members = [
     "crates/tollgate-settler",
 ]
 
+[workspace.package]
+license = "Apache-2.0"
+
 [workspace.dependencies]
 tokio = { version = "1.53", features = ["full"] }
 axum = "0.8"

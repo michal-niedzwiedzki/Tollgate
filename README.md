@@ -1120,9 +1120,23 @@ All four are detailed in the "Deferred" section of `NOTES.md`.
 | `plan.md` | The 46-task build plan, phase by phase, with a gate per phase |
 | `NOTES.md` | Decisions taken during execution (D1–D22), post-mortems on bugs found and fixed, and deferred items |
 | `EXECUTING.md` | How this repo is built with Claude Code, and the git policy |
+| `CONTRIBUTING.md` | Setup, the checks, house style, and how to report a security issue |
+| `LICENSE` | Apache License 2.0 |
 
 **Git policy:** the agent never runs git write commands. Every commit in this repository was made by
 a human after review.
+
+---
+
+## Licence
+
+[Apache License 2.0](LICENSE) — permissive, with an explicit patent grant, which is worth having in
+a payments implementation.
+
+Contributions are welcome and are accepted under the same terms; `CONTRIBUTING.md` covers the
+workflow, the checks that must pass, and where to report a security issue. Tollgate handles payment
+authorisations, so please report anything security-relevant privately rather than in a public
+issue.
 
 <div align="center">
 <br>

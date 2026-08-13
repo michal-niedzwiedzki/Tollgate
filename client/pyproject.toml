@@ -6,6 +6,8 @@ build-backend = "setuptools.build_meta"
 name = "tollgate-client"
 version = "0.1.0"
 description = "Python client for the Tollgate x402 payment gateway: 402 handling, EIP-3009 signing, and local capability delegation."
+license = "Apache-2.0"
+license-files = ["../LICENSE"]
 requires-python = ">=3.9"
 dependencies = [
     "httpx",
