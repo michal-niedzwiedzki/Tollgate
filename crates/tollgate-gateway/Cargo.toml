@@ -21,6 +21,7 @@ alloy = { workspace = true, default-features = false, features = ["std", "sol-ty
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 tower = { workspace = true }
+tower-http = { workspace = true, features = ["cors"] }
 hyper = { workspace = true, features = ["client", "http1"] }
 http = { workspace = true }
 hyper-util = { workspace = true, features = ["client", "client-legacy", "tokio", "http1"] }

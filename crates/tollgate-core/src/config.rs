@@ -19,6 +19,10 @@ pub struct Config {
     pub clock_skew_seconds: u64,
     pub settler_batch_size: u32,
     pub settler_flush_seconds: u64,
+    /// Origin the dashboard is served from, allowed through CORS (Task 9.1). A single explicit
+    /// origin rather than a wildcard: the gateway has write endpoints, and `*` would let any
+    /// page a browser loads register a provider or revoke a capability.
+    pub dashboard_origin: String,
 }
 
 impl Config {
@@ -37,12 +41,17 @@ impl Config {
             clock_skew_seconds: default_parsed("CLOCK_SKEW_SECONDS", 60)?,
             settler_batch_size: default_parsed("SETTLER_BATCH_SIZE", 50)?,
             settler_flush_seconds: default_parsed("SETTLER_FLUSH_SECONDS", 10)?,
+            dashboard_origin: default_string("DASHBOARD_ORIGIN", "http://localhost:3000"),
         })
     }
 }
 
 fn required(name: &str) -> Result<String> {
     env::var(name).map_err(|_| Error::MissingEnvVar(name.to_string()))
+}
+
+fn default_string(name: &str, default: &str) -> String {
+    env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
 fn required_parsed<T>(name: &str) -> Result<T>
@@ -105,6 +114,7 @@ mod tests {
             "CLOCK_SKEW_SECONDS",
             "SETTLER_BATCH_SIZE",
             "SETTLER_FLUSH_SECONDS",
+            "DASHBOARD_ORIGIN",
         ] {
             unsafe { env::remove_var(key) };
         }
@@ -128,6 +138,7 @@ mod tests {
         assert_eq!(cfg.clock_skew_seconds, 60);
         assert_eq!(cfg.settler_batch_size, 50);
         assert_eq!(cfg.settler_flush_seconds, 10);
+        assert_eq!(cfg.dashboard_origin, "http://localhost:3000");
 
         clear_all();
     }

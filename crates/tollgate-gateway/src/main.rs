@@ -5,6 +5,7 @@ use axum::Router;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::signal;
 use tollgate_core::{db, Config};
+use tower_http::cors::CorsLayer;
 
 // Task 5.1 builds the capability type, its hash and issuer recovery; Task 5.2 decodes the
 // chain from the request header and Task 5.3 walks it. Nothing calls into it until then.
@@ -77,6 +78,17 @@ async fn main() -> anyhow::Result<()> {
         receipt_signer: Arc::new(receipt_signer),
     };
 
+    // CORS for the dashboard (Task 9.1). One explicit origin, not `Any`: the gateway has write
+    // endpoints — provider registration, budget seeding, revocation — and a wildcard would let
+    // any page a browser happens to load call them. An unparseable origin is a startup failure
+    // rather than a silently CORS-less gateway the dashboard then fails against at runtime.
+    let cors = CorsLayer::new()
+        .allow_origin(state.cfg.dashboard_origin.parse::<http::HeaderValue>().map_err(
+            |e| anyhow::anyhow!("DASHBOARD_ORIGIN is not a valid origin header value: {e}"),
+        )?)
+        .allow_methods([http::Method::GET, http::Method::POST])
+        .allow_headers([http::header::CONTENT_TYPE]);
+
     let app = Router::new()
         .route("/health", get(routes::health))
         .route("/metrics", get(routes::metrics))
@@ -106,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
             "/v1/proxy/{provider_slug}/{*path}",
             any(routes::proxy::handle_proxy_request),
         )
+        .layer(cors)
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;

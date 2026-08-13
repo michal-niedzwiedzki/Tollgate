@@ -10,6 +10,7 @@ members = [
 tokio = { version = "1.53", features = ["full"] }
 axum = "0.8"
 tower = "0.5"
+tower-http = { version = "0.6", default-features = false }
 hyper = "1.11"
 http = "1"
 hyper-util = "0.1"

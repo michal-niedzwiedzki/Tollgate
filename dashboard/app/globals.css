@@ -1,0 +1,29 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Dark, dense, monospace for addresses and hashes (Task 9.1). Not theme-aware on purpose: this
+   is an operator console for a demo, and one committed look is less to keep consistent across
+   three views than two. */
+:root {
+  --background: #0b0d10;
+  --foreground: #e6e8eb;
+  --muted: #8b949e;
+  --border: #1f242b;
+  --panel: #11151a;
+  --accent: #4ea1ff;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* Addresses, hashes and amounts are monospace everywhere so columns of them line up and a
+   truncated hash is still comparable against a full one. */
+.mono {
+  font-family: var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo,
+    monospace;
+}

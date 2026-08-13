@@ -473,6 +473,7 @@ pub mod validate {
                 clock_skew_seconds: 60,
                 settler_batch_size: 50,
                 settler_flush_seconds: 10,
+                dashboard_origin: "http://localhost:3000".to_string(),
             }
         }
 

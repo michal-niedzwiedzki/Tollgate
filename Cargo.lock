@@ -5678,6 +5678,7 @@ dependencies = [
  "tokio",
  "tollgate-core",
  "tower",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "url",
