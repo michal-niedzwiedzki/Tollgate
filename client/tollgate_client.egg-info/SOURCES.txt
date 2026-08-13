@@ -1,6 +1,13 @@
+README.md
 pyproject.toml
+tests/test_capability.py
+tests/test_e2e.py
+tests/test_session.py
 tests/test_signing.py
 tollgate/__init__.py
+tollgate/capability.py
+tollgate/errors.py
+tollgate/session.py
 tollgate/signing.py
 tollgate_client.egg-info/PKG-INFO
 tollgate_client.egg-info/SOURCES.txt

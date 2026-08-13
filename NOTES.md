@@ -603,3 +603,20 @@ resolve as a prerequisite either.
 **Effect if left as is:** a Postgres blip mid-demo makes in-flight requests 500 instead of degrading
 to a Redis-only path. Fail-closed, not a correctness or security issue — no data is lost, no charge
 is mis-attributed. Does not block Phase 4.
+
+### The root README's build-status table is stale
+
+**Found:** 2026-08-13, during Task 8.4, while adding the measured quickstart duration.
+
+`README.md`'s "Build status" table and the "Requirements status" paragraph below it still say
+Phase 7 and Phase 8 are not started and that F6 and F9 are not built. Phase 7 was completed and
+committed on 2026-08-12, and Phase 8's Tasks 8.1–8.4 are complete. The phase-6 row and the
+Task 6.6 caveat above it remain accurate.
+
+**Why deferred, not fixed:** Task 8.4's Implementation section names `client/README.md` and
+`client/examples/quickstart.py`, and its Verification block asks for exactly one root-README
+change — the measured duration. Rewriting the status table is a different edit with a different
+reviewer question attached ("is this claim true yet?"), and Phase 8 is not finished until its Gate
+passes, so the honest moment to update it is at that gate rather than mid-phase.
+
+**Effect if left as is:** a reader of the root README understates what is built. No code impact.

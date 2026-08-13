@@ -137,6 +137,35 @@ TOLLGATE_ALLOW_LOOPBACK_UPSTREAM=true cargo run -p tollgate-gateway   # see the 
 `scripts/seed_providers.sh` registers `mock-ok`, `mock-slow` (`timeout_ms: 1000`) and `mock-fail`
 against it, all priced at `0.001` USDC.
 
+### 5. Pay for a call from Python
+
+```bash
+pip install -e client/
+curl -s -X POST localhost:8080/v1/providers -H 'content-type: application/json' \
+  -d '{"slug":"quickstart","upstream_url":"http://127.0.0.1:9000",
+       "price":"0.001","payout_address":"0x0000000000000000000000000000000000000001"}'
+python3 client/examples/quickstart.py
+```
+
+That curl is the whole provider path — no signup, no billing code — and `quickstart.py` is the
+agent path: it seeds a budget for a fresh keypair, pays a 402 transparently, and prints the
+upstream body with a receipt signature.
+
+`client/README.md` is the client's own documentation: install, the one-curl provider path, the
+delegation sample, the exception table, and what is mocked.
+
+**Time from zero to a paid response: 12 seconds, measured.** `prd.md` §8 budgets 3 minutes for
+provider integration. The measurement starts from a torn-down stack — `docker compose down -v`, so
+no containers and no database, `.env` deleted, and `tollgate-client` uninstalled — and covers
+`pip install -e client/`, `./scripts/dev.sh`, sourcing `.env`, starting the mock upstream, starting
+the gateway with `cargo run -p tollgate-gateway`, waiting for `/health`, registering a provider with
+one curl, and running `quickstart.py` through to a `200` and a printed receipt signature.
+
+The one thing it assumes is a **warm cargo cache**: the Rust workspace is already built, so
+`cargo run` re-links rather than compiling from scratch. A first-ever build of the dependency tree
+takes several minutes and is a one-time toolchain cost, not part of integrating a provider, which is
+what the `prd.md` metric measures.
+
 ---
 
 ## Walkthrough: an unpaid request becomes a paid one
