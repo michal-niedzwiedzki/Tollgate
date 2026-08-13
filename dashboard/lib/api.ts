@@ -75,6 +75,13 @@ export interface ExpenseNode {
   spent: string;
   max_total: string;
   remaining: string;
+  /// Null when this capability inherits its parent's allowlist, and on a payer-level node,
+  /// which has no capability row at all. Null is not an empty allowlist.
+  allowlist: string[] | null;
+  /// Unix seconds. Null on a payer-level node.
+  expiry: number | null;
+  /// RFC 3339, or null if this capability has not been revoked.
+  revoked_at: string | null;
   children: ExpenseNode[];
 }
 

@@ -104,6 +104,16 @@ fn build_node(
         // Saturating: a capability whose limits were lowered after it had already spent would
         // otherwise underflow. Zero remaining is the honest answer there.
         "remaining": format_usdc(max_total.saturating_sub(spent)),
+        // The three the delegation tree's cards render (Task 9.3). All already in hand here, so
+        // emitting them costs no extra query — and keeps every figure on one card sourced from
+        // the ledger rather than half from Redis (D16).
+        //
+        // `allowlist` is null when this capability inherits its parent's (`allowlistHash == 0x0`)
+        // and `revoked_at` is null unless it has been revoked, so neither is a "no value" that
+        // reads as an empty set.
+        "allowlist": record.allowlist,
+        "expiry": record.expiry,
+        "revoked_at": capability.revoked_at,
         "children": children,
     }))
 }
@@ -250,6 +260,13 @@ pub async fn expense_report(
             "spent": format_usdc(spent),
             "max_total": format_usdc(max_total),
             "remaining": format_usdc(max_total.saturating_sub(spent)),
+            // Null rather than absent, so a payer-level node has the same shape as a capability
+            // one and the tree needs no second case. A payer budget is seeded by
+            // `POST /v1/budgets` and has no `capabilities` row (D1), so it genuinely has no
+            // allowlist, no expiry, and nothing that could revoke it.
+            "allowlist": Value::Null,
+            "expiry": Value::Null,
+            "revoked_at": Value::Null,
             "children": [],
         })]
     };
