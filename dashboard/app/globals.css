@@ -12,6 +12,10 @@
   --border: #1f242b;
   --panel: #11151a;
   --accent: #4ea1ff;
+
+  /* Without this the browser paints form controls and scrollbars from its own light default,
+     so the charge table's scrollbar arrives as a bright grey slab against the panel. */
+  color-scheme: dark;
 }
 
 body {
@@ -19,6 +23,40 @@ body {
   color: var(--foreground);
   font-size: 13px;
   line-height: 1.5;
+}
+
+/* A thin scrollbar in the panel's own colours, so a scrolling table reads as part of the panel
+   rather than as a control bolted onto it. Firefox takes the standard properties; Chromium and
+   Safari need the -webkit- pseudo-elements, which is why both are here. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: var(--border);
+  border-radius: 5px;
+  /* Inset via a transparent border so the thumb sits off the table's edge instead of flush
+     against the panel's rounded corner. */
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: #2c333c;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 /* Addresses, hashes and amounts are monospace everywhere so columns of them line up and a
