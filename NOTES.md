@@ -334,6 +334,66 @@ microsecond resolution and would drop a row; a monotonic cursor is the fix if th
 `voided` charges are excluded, as everywhere else, and `status` is included so a reader can tell
 a settled charge from a queued one without inferring it from `tx_hash` being null.
 
+### Phase 10 — demo, documentation, hardening
+
+Settled 2026-08-13, before and during Task 10.1.
+
+**D20. The sample agents do not fund the worker wallets. Resolution A funding is a documented
+prerequisite instead.**
+
+Raised as a blocking question and **decided by the human**, in the same shape as D17 and the two
+Task 9.2 items.
+
+Task 10.1 says the supervisor "funds three worker wallets (Resolution A)". Nothing in the repo
+can do that: `client/` depends on `httpx`, `eth-account` and `eth-utils` and has no
+transaction-sending path, and the only chain available is `scripts/anvil.sh`'s fork, because
+Task 6.6 is still deferred. Adding `web3` to the client, or shelling out to `cast`, would both
+reach outside a task whose Implementation section describes three files under `examples/agents/`.
+
+What makes deferring safe rather than merely convenient: **the gateway never reads a balance.**
+It verifies the EIP-3009 signature and enforces caps, and USDC is what checks that the payer can
+actually pay — at settlement, which is exactly what Task 6.6 has not run. So every beat of
+`prd.md` §9 except step 4 is fully exercised by unfunded wallets, including the one the demo
+exists to show. The alternatives (fund via `cast` against the fork, or fund optionally behind an
+env flag) were rejected as adding anvil, foundry and a deployed `BatchSettler` to the demo's
+dependency list, plus a second rehearsal configuration for Task 10.4.
+
+Recorded in `supervisor.py`'s module docstring so a reader of the demo meets the boundary where
+they would otherwise assume funding happened. Closing Task 6.6 is what closes this.
+
+**D21. Worker 2 stops with `InsufficientBudget`, not `CapExceeded`. Task 10.1's verification
+wording repeats the error D11 already corrected.**
+
+Task 10.1's Verification block says worker 2 "stops with a `CapExceeded` naming its level". It
+stops with **`InsufficientBudget`** — the client's 402 `insufficient_funds` type. This is the
+same total-cap/per-request-cap conflation D11 found in the Phase 5 Gate, arriving a second time
+in a different file, and the same four sources still say the code is right:
+`architecture.md` §4.3, `plan.md` Task 3.3, the Phase 3 Gate, and `prd.md` §9 step 3, which
+specifies no status code at all and asks only that worker 2 "hits its cap mid-task and stops".
+
+`client/tollgate/errors.py` already draws the distinction the demo needs — an exhausted total
+means stop, an over-large single call means retry smaller — so `worker.py` catches both and
+prints which one fired. Observed: workers 1 and 3 finish 6/6, worker 2 pays twice against its
+0.002 cap and is then refused at `tripped_level 1`, its own leaf.
+
+Unlike D11, **no edit was made to `plan.md`**. D11 changed a Phase Gate line because a gate is a
+pass/fail checklist that would otherwise have been failed by correct code. This is a verification
+line inside a task, the task's real requirement (worker 2 stops, its siblings do not) is met, and
+the plan is better left as the human wrote it with the discrepancy recorded here.
+
+**D22. Per-endpoint totals are summed by the supervisor from the signed charge list.**
+
+Task 10.1's verification asks the printed expense report to carry "per-endpoint totals".
+`GET /v1/expense-report` (Task 7.2) returns `charges[]` with a `provider` on each and a `nodes`
+tree of per-capability spend, but no per-provider rollup. Adding a `by_provider` field would be a
+Phase 7 gateway change made during Phase 10, outside this task's Implementation section — the
+same reasoning that kept `?provider=` out of `/v1/feed` during Task 9.2.
+
+So `supervisor.py report` sums the charge list itself. This is not a workaround: the signature
+covers the charges and each names its provider, so a total derived from them is checkable against
+the signed artifact, whereas a server-side rollup would be one more figure to trust. A rollup
+inside the signed body is the better long-term answer and belongs in a Phase 7 task, not here.
+
 ---
 
 ## Fixed
